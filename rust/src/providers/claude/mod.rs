@@ -257,7 +257,17 @@ impl Provider for ClaudeProvider {
             SourceMode::Auto => self.fetch_via_auto(ctx).await,
             SourceMode::OAuth => self.fetch_via_oauth(ctx).await,
             SourceMode::Web => self.fetch_via_web(ctx).await,
-            SourceMode::Cli => self.fetch_via_cli(ctx).await,
+            SourceMode::Cli => match self.fetch_via_cli(ctx).await {
+                Ok(result) => Ok(result),
+                Err(error) if should_fallback_from_claude_cli_error(&error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "Claude CLI usage probe failed with a fallback-safe error; trying OAuth"
+                    );
+                    self.fetch_via_oauth(ctx).await
+                }
+                Err(error) => Err(error),
+            },
         }
     }
 
@@ -540,6 +550,22 @@ fn claude_auto_fetch_error(failures: Vec<(&'static str, ProviderError)>) -> Prov
     ))
 }
 
+fn should_fallback_from_claude_cli_error(error: &ProviderError) -> bool {
+    match error {
+        ProviderError::Parse(message) => {
+            matches!(
+                message.as_str(),
+                "Claude CLI did not return usage data" | "Empty output from Claude CLI"
+            )
+        }
+        ProviderError::Other(message) => {
+            message.contains("returned local activity stats")
+                || message.contains("treated /usage as a normal prompt")
+        }
+        _ => false,
+    }
+}
+
 /// Try to find the claude CLI binary
 fn which_claude() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
@@ -585,12 +611,15 @@ fn which_claude() -> Option<std::path::PathBuf> {
 
 #[cfg(windows)]
 fn find_windows_claude_in_path() -> Option<std::path::PathBuf> {
-    let output = StdCommand::new("where")
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let mut command = StdCommand::new("where");
+    command
         .arg("claude")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .creation_flags(CREATE_NO_WINDOW);
+    let output = command.output().ok()?;
 
     if !output.status.success() {
         return None;

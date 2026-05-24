@@ -62,6 +62,8 @@ pub(crate) fn build_fetch_context(
             _ => (usage_source, stored_cookie),
         }
     };
+    let (source_mode, cookie_header) =
+        normalize_provider_source(id, source_mode, cookie_header, usage_source);
 
     let api_key = api_keys
         .get(id.cli_name())
@@ -74,6 +76,23 @@ pub(crate) fn build_fetch_context(
         api_key,
         ..FetchContext::default()
     }
+}
+
+fn normalize_provider_source(
+    id: ProviderId,
+    source_mode: SourceMode,
+    cookie_header: Option<String>,
+    usage_source: SourceMode,
+) -> (SourceMode, Option<String>) {
+    if id != ProviderId::Claude || cookie_header.is_some() {
+        return (source_mode, cookie_header);
+    }
+
+    let source_mode = match usage_source {
+        SourceMode::Cli => SourceMode::Cli,
+        _ => SourceMode::OAuth,
+    };
+    (source_mode, None)
 }
 
 const PROVIDER_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);

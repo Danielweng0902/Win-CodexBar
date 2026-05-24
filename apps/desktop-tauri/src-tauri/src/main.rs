@@ -23,11 +23,79 @@ use surface::SurfaceMode;
 use surface_target::SurfaceTarget;
 use tauri::Manager;
 
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCommandLineW() -> *const u16;
+}
+
 fn should_hide_close_request(mode: SurfaceMode) -> bool {
     matches!(
         mode,
         SurfaceMode::TrayPanel | SurfaceMode::PopOut | SurfaceMode::Settings
     )
+}
+
+fn launch_target_from_args(args: &[String]) -> Option<(SurfaceMode, SurfaceTarget)> {
+    args.iter().find_map(|arg| match arg.as_str() {
+        "menubar" | "tray" | "tray-panel" => Some((SurfaceMode::TrayPanel, SurfaceTarget::Summary)),
+        "settings" => Some((
+            SurfaceMode::Settings,
+            SurfaceTarget::Settings {
+                tab: "general".into(),
+            },
+        )),
+        _ => None,
+    })
+}
+
+fn launch_target_from_current_process() -> Option<(SurfaceMode, SurfaceTarget)> {
+    launch_target_from_args(&std::env::args().collect::<Vec<_>>())
+        .or_else(launch_target_from_raw_command_line)
+}
+
+#[cfg(windows)]
+fn launch_target_from_raw_command_line() -> Option<(SurfaceMode, SurfaceTarget)> {
+    let raw = windows_raw_command_line()?;
+    if raw.contains("menubar") || raw.contains("tray-panel") || raw.contains(" tray") {
+        return Some((SurfaceMode::TrayPanel, SurfaceTarget::Summary));
+    }
+    if raw.contains("settings") {
+        return Some((
+            SurfaceMode::Settings,
+            SurfaceTarget::Settings {
+                tab: "general".into(),
+            },
+        ));
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn launch_target_from_raw_command_line() -> Option<(SurfaceMode, SurfaceTarget)> {
+    None
+}
+
+#[cfg(windows)]
+fn windows_raw_command_line() -> Option<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    unsafe {
+        let ptr = GetCommandLineW();
+        if ptr.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        Some(
+            OsString::from_wide(std::slice::from_raw_parts(ptr, len))
+                .to_string_lossy()
+                .into(),
+        )
+    }
 }
 
 fn main() {
@@ -36,6 +104,8 @@ fn main() {
     let proof_config = proof_harness::ProofConfig::from_env();
     let is_proof_mode = proof_config.is_some();
     let force_start_visible = std::env::var_os("CODEXBAR_START_VISIBLE").is_some();
+    let launch_target = launch_target_from_current_process();
+    let start_visible = force_start_visible || launch_target.is_some();
 
     let mut initial_state = AppState::new();
     initial_state.proof_config = proof_config;
@@ -43,9 +113,10 @@ fn main() {
     tauri::Builder::default()
         .manage(Mutex::new(initial_state))
         .plugin(shortcut_bridge::plugin())
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            let _ =
-                shell::reopen_to_target(app, SurfaceMode::TrayPanel, SurfaceTarget::Summary, None);
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            let (mode, target) = launch_target_from_args(&args)
+                .unwrap_or((SurfaceMode::TrayPanel, SurfaceTarget::Summary));
+            let _ = shell::reopen_to_target(app, mode, target, None);
         }))
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
@@ -123,7 +194,9 @@ fn main() {
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
                 shell::dwm::force_dark_caption(&window);
-                window.hide()?;
+                if !start_visible {
+                    window.hide()?;
+                }
             }
             tray_bridge::setup(app)?;
             shortcut_bridge::register(app.handle());
@@ -137,16 +210,20 @@ fn main() {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     proof_harness::activate(&app_handle);
                 });
-            } else if force_start_visible {
+            } else if force_start_visible || launch_target.is_some() {
                 let app = app.handle().clone();
+                let (mode, target) =
+                    launch_target.unwrap_or((SurfaceMode::TrayPanel, SurfaceTarget::Summary));
+                let _ = shell::reopen_to_target(&app, mode, target.clone(), None);
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = shell::apply_window_properties(&window, &mode.window_properties());
+                }
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(250)).await;
-                    let _ = shell::reopen_to_target(
-                        &app,
-                        SurfaceMode::TrayPanel,
-                        SurfaceTarget::Summary,
-                        None,
-                    );
+                    let _ = shell::reopen_to_target(&app, mode, target, None);
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = shell::apply_window_properties(&window, &mode.window_properties());
+                    }
                 });
             }
 
@@ -221,5 +298,37 @@ mod tests {
     #[test]
     fn close_request_leaves_hidden_surface_alone() {
         assert!(!should_hide_close_request(SurfaceMode::Hidden));
+    }
+
+    #[test]
+    fn launch_arg_menubar_opens_tray_panel() {
+        let args = vec!["codexbar.exe".to_string(), "menubar".to_string()];
+        assert_eq!(
+            launch_target_from_args(&args),
+            Some((SurfaceMode::TrayPanel, SurfaceTarget::Summary))
+        );
+    }
+
+    #[test]
+    fn launch_arg_menubar_without_exe_opens_tray_panel() {
+        let args = vec!["menubar".to_string()];
+        assert_eq!(
+            launch_target_from_args(&args),
+            Some((SurfaceMode::TrayPanel, SurfaceTarget::Summary))
+        );
+    }
+
+    #[test]
+    fn launch_arg_settings_opens_settings() {
+        let args = vec!["codexbar.exe".to_string(), "settings".to_string()];
+        assert_eq!(
+            launch_target_from_args(&args),
+            Some((
+                SurfaceMode::Settings,
+                SurfaceTarget::Settings {
+                    tab: "general".into(),
+                },
+            ))
+        );
     }
 }

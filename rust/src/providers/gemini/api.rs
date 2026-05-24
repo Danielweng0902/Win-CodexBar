@@ -81,9 +81,12 @@ impl GeminiApi {
         let creds_path = self.home_dir.join(".gemini").join("oauth_creds.json");
 
         if !creds_path.exists() {
-            return Err(ProviderError::NotInstalled(
-                "Not logged in to Gemini. Run 'gemini' in Terminal to authenticate.".to_string(),
-            ));
+            let hint = if which::which("gemini").is_ok() {
+                "Not logged in to Gemini. Run 'gemini' in Terminal to authenticate."
+            } else {
+                "Gemini CLI credentials not found and 'gemini' is not on PATH. Install Gemini CLI, then run 'gemini' in Terminal to authenticate."
+            };
+            return Err(ProviderError::NotInstalled(hint.to_string()));
         }
 
         let content = std::fs::read_to_string(&creds_path).map_err(|e| {

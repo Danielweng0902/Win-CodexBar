@@ -497,12 +497,17 @@ pub(super) fn apply_transition(
 
 /// Toggle the tray panel: hide if currently showing, show at `position` otherwise.
 pub fn toggle_tray_panel(app: &AppHandle, position: Option<(i32, i32)>) {
-    let current = {
+    let (current, main_visible) = {
         let st = app.state::<Mutex<AppState>>();
-        st.lock().unwrap().surface_machine.current()
+        let current = st.lock().unwrap().surface_machine.current();
+        let main_visible = app
+            .get_webview_window("main")
+            .and_then(|window| window.is_visible().ok())
+            .unwrap_or(false);
+        (current, main_visible)
     };
 
-    if current == SurfaceMode::TrayPanel {
+    if current == SurfaceMode::TrayPanel && main_visible {
         let _ = super::window::hide_to_tray(app);
     } else {
         let _ = transition_to_target(

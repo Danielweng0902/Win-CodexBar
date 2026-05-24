@@ -39,18 +39,19 @@ impl AntigravityProvider {
         }
     }
 
-    /// Detect running Antigravity language server and extract connection info
-    fn detect_process_info() -> Result<ProcessInfo, ProviderError> {
+    /// Detect running Antigravity language servers and extract connection info.
+    fn detect_process_infos() -> Result<Vec<ProcessInfo>, ProviderError> {
         // Use PowerShell to get process command lines
         #[cfg(windows)]
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
         let mut cmd = Command::new("powershell.exe");
         cmd.args([
-                "-ExecutionPolicy", "Bypass",
-                "-Command",
-                "Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*language_server_windows*' } | Select-Object -ExpandProperty CommandLine"
-            ]);
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*language_server_windows*' } | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+        ]);
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
@@ -65,6 +66,7 @@ impl AntigravityProvider {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let rows = parse_detected_processes(stdout.trim())?;
 
         // Parse command line for CSRF token and port — compiled once
         static CSRF_RE: OnceLock<Regex> = OnceLock::new();
@@ -78,7 +80,11 @@ impl AntigravityProvider {
         let port_regex = PORT_RE
             .get_or_init(|| Regex::new(r"--extension_server_port\s+(\d+)").expect("valid regex"));
 
-        for line in stdout.lines() {
+        let mut infos = Vec::new();
+        for row in rows {
+            let Some(line) = row.command_line.as_deref() else {
+                continue;
+            };
             if line.contains("language_server_windows") && line.contains("--csrf_token") {
                 let csrf_token = csrf_regex
                     .captures(line)
@@ -96,7 +102,8 @@ impl AntigravityProvider {
                     .and_then(|m| m.as_str().parse::<u16>().ok());
 
                 if let (Some(token), Some(p)) = (csrf_token, port) {
-                    return Ok(ProcessInfo {
+                    infos.push(ProcessInfo {
+                        process_id: row.process_id,
                         csrf_token: token,
                         extension_server_csrf_token: ext_csrf_token,
                         extension_port: p,
@@ -105,64 +112,48 @@ impl AntigravityProvider {
             }
         }
 
-        Err(ProviderError::NotInstalled(
-            "Antigravity language server not running".to_string(),
-        ))
+        if infos.is_empty() {
+            Err(ProviderError::NotInstalled(
+                "Antigravity language server not running".to_string(),
+            ))
+        } else {
+            Ok(infos)
+        }
     }
 
-    /// Find the actual API port by checking listening ports
-    async fn find_api_port(extension_port: u16) -> Result<u16, ProviderError> {
+    /// Find the actual API endpoint by checking listening ports
+    async fn find_api_endpoint(process_info: &ProcessInfo) -> Result<ApiEndpoint, ProviderError> {
         // The language server listens on multiple ports near the extension port
-        // Try ports in range extension_port to extension_port + 20
+        // and sometimes on ports owned by the language-server process but far
+        // away from the extension-server port.
         // SECURITY: TLS verification is disabled because the local language server uses
-        // self-signed certificates. This is scoped to 127.0.0.1 only and the port range
-        // is limited. We verify the server responds with the expected gRPC endpoint.
+        // self-signed certificates. This is scoped to 127.0.0.1 only. We verify
+        // the server responds with the expected gRPC endpoint.
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_millis(900))
             .danger_accept_invalid_certs(true)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
-        for offset in 0..20 {
-            let port = extension_port + offset;
-            let url = format!(
-                "https://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/GetUnleashData",
-                port
-            );
+        for port in candidate_api_ports(process_info) {
+            for scheme in ["https", "http"] {
+                let url = format!(
+                    "{}://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/GetUnleashData",
+                    scheme, port
+                );
 
-            // Just check if the port responds (even with error)
-            if let Ok(resp) = client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("Connect-Protocol-Version", "1")
-                .body("{}")
-                .send()
-                .await
-            {
-                // If we get any response (even error), this is the API port
-                if resp.status().as_u16() == 200 || resp.status().as_u16() == 401 {
-                    return Ok(port);
+                if let Ok(resp) = client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .header("Connect-Protocol-Version", "1")
+                    .body("{}")
+                    .send()
+                    .await
+                    && (resp.status().as_u16() == 200 || resp.status().as_u16() == 401)
+                {
+                    return Ok(ApiEndpoint { scheme, port });
                 }
-            }
-        }
-
-        // Fallback: try common ports
-        for port in [53835, 53836, 53837, 53838, 53845, 53849] {
-            let url = format!(
-                "https://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/GetUnleashData",
-                port
-            );
-            if let Ok(resp) = client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("Connect-Protocol-Version", "1")
-                .body("{}")
-                .send()
-                .await
-                && (resp.status().as_u16() == 200 || resp.status().as_u16() == 401)
-            {
-                return Ok(port);
             }
         }
 
@@ -173,8 +164,34 @@ impl AntigravityProvider {
 
     /// Fetch user status from Antigravity API
     async fn fetch_user_status(&self) -> Result<UsageSnapshot, ProviderError> {
-        let process_info = Self::detect_process_info()?;
-        let api_port = Self::find_api_port(process_info.extension_port).await?;
+        let process_infos = Self::detect_process_infos()?;
+        let mut failures = Vec::new();
+
+        for process_info in process_infos {
+            match self.fetch_user_status_for_process(&process_info).await {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error) => failures.push(format!(
+                    "pid {}: {}",
+                    process_info
+                        .process_id
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    error
+                )),
+            }
+        }
+
+        Err(ProviderError::Other(format!(
+            "Antigravity probe failed from all detected language servers. {}",
+            failures.join("; ")
+        )))
+    }
+
+    async fn fetch_user_status_for_process(
+        &self,
+        process_info: &ProcessInfo,
+    ) -> Result<UsageSnapshot, ProviderError> {
+        let api_endpoint = Self::find_api_endpoint(process_info).await?;
 
         // SECURITY: TLS verification disabled for local language server (see find_api_port)
         let client = reqwest::Client::builder()
@@ -185,8 +202,8 @@ impl AntigravityProvider {
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
         let url = format!(
-            "https://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/GetUserStatus",
-            api_port
+            "{}://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/GetUserStatus",
+            api_endpoint.scheme, api_endpoint.port
         );
 
         let body = serde_json::json!({
@@ -361,9 +378,99 @@ impl Provider for AntigravityProvider {
 }
 
 struct ProcessInfo {
+    process_id: Option<u32>,
     csrf_token: String,
     extension_server_csrf_token: Option<String>,
     extension_port: u16,
+}
+
+struct ApiEndpoint {
+    scheme: &'static str,
+    port: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DetectedProcess {
+    process_id: Option<u32>,
+    command_line: Option<String>,
+}
+
+fn parse_detected_processes(stdout: &str) -> Result<Vec<DetectedProcess>, ProviderError> {
+    if stdout.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let value: serde_json::Value = serde_json::from_str(stdout)
+        .map_err(|e| ProviderError::Parse(format!("Invalid Antigravity process list: {e}")))?;
+
+    match value {
+        serde_json::Value::Array(_) => serde_json::from_value(value)
+            .map_err(|e| ProviderError::Parse(format!("Invalid Antigravity process row: {e}"))),
+        serde_json::Value::Object(_) => {
+            let row = serde_json::from_value(value).map_err(|e| {
+                ProviderError::Parse(format!("Invalid Antigravity process row: {e}"))
+            })?;
+            Ok(vec![row])
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn candidate_api_ports(process_info: &ProcessInfo) -> Vec<u16> {
+    let mut ports = Vec::new();
+    if let Some(process_id) = process_info.process_id {
+        ports.extend(listening_ports_for_process(process_id));
+    }
+    for offset in 0..20 {
+        ports.push(process_info.extension_port.saturating_add(offset));
+    }
+    ports.extend([53835, 53836, 53837, 53838, 53845, 53849]);
+    dedup_ports(ports)
+}
+
+fn dedup_ports(ports: Vec<u16>) -> Vec<u16> {
+    let mut out = Vec::new();
+    for port in ports {
+        if port != 0 && !out.contains(&port) {
+            out.push(port);
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+fn listening_ports_for_process(process_id: u32) -> Vec<u16> {
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args([
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &format!(
+            "Get-NetTCPConnection -State Listen -OwningProcess {} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty LocalPort",
+            process_id
+        ),
+    ]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let Ok(output) = cmd.output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u16>().ok())
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn listening_ports_for_process(_process_id: u32) -> Vec<u16> {
+    Vec::new()
 }
 
 // API Response types
@@ -481,6 +588,33 @@ mod tests {
         assert_eq!(classify_model("Flash Model"), ModelFamily::GeminiFlash);
         assert_eq!(classify_model("GPT-4o"), ModelFamily::Other);
         assert_eq!(classify_model("unknown-model"), ModelFamily::Other);
+    }
+
+    #[test]
+    fn parse_detected_processes_accepts_single_object() {
+        let rows = parse_detected_processes(
+            r#"{"ProcessId":123,"CommandLine":"language_server_windows_x64.exe --csrf_token abc --extension_server_port 49152"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].process_id, Some(123));
+    }
+
+    #[test]
+    fn candidate_api_ports_includes_extension_range_and_dedups() {
+        let info = ProcessInfo {
+            process_id: None,
+            csrf_token: "abc".into(),
+            extension_server_csrf_token: None,
+            extension_port: 49152,
+        };
+
+        let ports = candidate_api_ports(&info);
+        assert!(ports.contains(&49152));
+        assert!(ports.contains(&49171));
+        assert!(ports.contains(&53835));
+        assert_eq!(ports.iter().filter(|&&port| port == 49152).count(), 1);
     }
 
     fn make_response(models: Vec<(&str, f64)>) -> UserStatusResponse {

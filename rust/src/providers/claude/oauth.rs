@@ -60,25 +60,25 @@ struct OAuthData {
 /// OAuth usage response from Claude API
 #[derive(Debug, Deserialize)]
 pub struct OAuthUsageResponse {
-    #[serde(rename = "fiveHour")]
+    #[serde(rename = "fiveHour", alias = "five_hour")]
     pub five_hour: Option<UsageWindow>,
 
-    #[serde(rename = "sevenDay")]
+    #[serde(rename = "sevenDay", alias = "seven_day")]
     pub seven_day: Option<UsageWindow>,
 
-    #[serde(rename = "sevenDaySonnet")]
+    #[serde(rename = "sevenDaySonnet", alias = "seven_day_sonnet")]
     pub seven_day_sonnet: Option<UsageWindow>,
 
-    #[serde(rename = "sevenDayOpus")]
+    #[serde(rename = "sevenDayOpus", alias = "seven_day_opus")]
     pub seven_day_opus: Option<UsageWindow>,
 
-    #[serde(rename = "sevenDayDesign")]
+    #[serde(rename = "sevenDayDesign", alias = "seven_day_design")]
     pub seven_day_design: Option<UsageWindow>,
 
-    #[serde(rename = "sevenDayRoutines")]
+    #[serde(rename = "sevenDayRoutines", alias = "seven_day_routines")]
     pub seven_day_routines: Option<UsageWindow>,
 
-    #[serde(rename = "extraUsage")]
+    #[serde(rename = "extraUsage", alias = "extra_usage")]
     pub extra_usage: Option<ExtraUsage>,
 }
 
@@ -87,20 +87,20 @@ pub struct OAuthUsageResponse {
 pub struct UsageWindow {
     pub utilization: Option<f64>,
 
-    #[serde(rename = "resetsAt")]
+    #[serde(rename = "resetsAt", alias = "resets_at")]
     pub resets_at: Option<String>,
 }
 
 /// Extra usage (credits) info
 #[derive(Debug, Deserialize)]
 pub struct ExtraUsage {
-    #[serde(rename = "isEnabled")]
+    #[serde(rename = "isEnabled", alias = "is_enabled")]
     pub is_enabled: Option<bool>,
 
-    #[serde(rename = "usedCredits")]
+    #[serde(rename = "usedCredits", alias = "used_credits")]
     pub used_credits: Option<f64>,
 
-    #[serde(rename = "monthlyLimit")]
+    #[serde(rename = "monthlyLimit", alias = "monthly_limit")]
     pub monthly_limit: Option<f64>,
 
     pub currency: Option<String>,
@@ -112,7 +112,7 @@ pub struct ClaudeOAuthFetcher {
 }
 
 impl ClaudeOAuthFetcher {
-    const USAGE_URL: &'static str = "https://api.claude.ai/api/usage";
+    const USAGE_URL: &'static str = "https://api.anthropic.com/api/oauth/usage";
     const CREDENTIALS_PATH: &'static str = ".claude/.credentials.json";
     const ENV_TOKEN_KEY: &'static str = "CODEXBAR_CLAUDE_OAUTH_TOKEN";
     const ENV_SCOPES_KEY: &'static str = "CODEXBAR_CLAUDE_OAUTH_SCOPES";
@@ -282,6 +282,8 @@ impl ClaudeOAuthFetcher {
                 "Authorization",
                 format!("Bearer {}", credentials.access_token),
             )
+            .header("Accept", "application/json")
+            .header("anthropic-beta", "oauth-2025-04-20")
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?;

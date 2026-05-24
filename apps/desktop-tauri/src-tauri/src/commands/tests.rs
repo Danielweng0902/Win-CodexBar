@@ -342,6 +342,45 @@ fn fetch_context_claude_oauth_token_account_uses_oauth() {
 }
 
 #[test]
+fn fetch_context_claude_without_cookie_defaults_to_oauth() {
+    let settings = Settings::default();
+    let cookies = ManualCookies::default();
+    let api_keys = ApiKeys::default();
+    let token_accounts = HashMap::new();
+
+    let ctx = super::build_fetch_context(
+        ProviderId::Claude,
+        &settings,
+        &cookies,
+        &api_keys,
+        &token_accounts,
+    );
+
+    assert_eq!(ctx.source_mode, SourceMode::OAuth);
+    assert!(ctx.manual_cookie_header.is_none());
+}
+
+#[test]
+fn fetch_context_claude_explicit_cli_stays_cli() {
+    let mut settings = Settings::default();
+    settings.set_usage_source(ProviderId::Claude, "cli");
+    let cookies = ManualCookies::default();
+    let api_keys = ApiKeys::default();
+    let token_accounts = HashMap::new();
+
+    let ctx = super::build_fetch_context(
+        ProviderId::Claude,
+        &settings,
+        &cookies,
+        &api_keys,
+        &token_accounts,
+    );
+
+    assert_eq!(ctx.source_mode, SourceMode::Cli);
+    assert!(ctx.manual_cookie_header.is_none());
+}
+
+#[test]
 fn fetch_context_copilot_token_account_uses_oauth_api_key() {
     let settings = Settings::default();
     let cookies = ManualCookies::default();
