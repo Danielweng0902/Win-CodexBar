@@ -5,10 +5,16 @@
 use crate::browser::cookies::get_cookie_header;
 use crate::core::{CostSnapshot, ProviderError, RateWindow};
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use serde::{Deserialize, de::DeserializeOwned};
+use std::path::{Path, PathBuf};
 
 const BASE_URL: &str = "https://cursor.com";
+const DASHBOARD_BASE_URL: &str = "https://api2.cursor.sh/aiserver.v1.DashboardService";
 const COOKIE_DOMAINS: [&str; 2] = ["cursor.com", "cursor.sh"];
+const CURSOR_ACCESS_TOKEN_KEY: &str = "cursorAuth/accessToken";
+const CURSOR_EMAIL_KEY: &str = "cursorAuth/cachedEmail";
+const CURSOR_MEMBERSHIP_KEY: &str = "cursorAuth/stripeMembershipType";
 
 pub(super) type CursorUsageResult = (
     RateWindow,
@@ -34,9 +40,24 @@ impl CursorApi {
     /// Fetch usage information from Cursor API
     /// Returns (primary, secondary, model_specific, cost, email, plan_type)
     pub async fn fetch_usage(&self) -> Result<CursorUsageResult, ProviderError> {
-        // Try to get cookies from browser
-        let cookie_header = self.get_cookie_header()?;
-        self.fetch_usage_with_cookie_header(&cookie_header).await
+        match self.get_cookie_header() {
+            Ok(cookie_header) => match self.fetch_usage_with_cookie_header(&cookie_header).await {
+                Ok(result) => Ok(result),
+                Err(web_error) => self
+                    .fetch_usage_from_cursor_ide()
+                    .await
+                    .or(Err(web_error)),
+            },
+            Err(cookie_error) => self
+                .fetch_usage_from_cursor_ide()
+                .await
+                .map_err(|ide_error| match cookie_error {
+                    ProviderError::NoCookies => ProviderError::Other(format!(
+                        "No Cursor browser cookies and Cursor IDE session fallback failed: {ide_error}"
+                    )),
+                    other => other,
+                }),
+        }
     }
 
     /// Fetch usage information with an already resolved Cookie header.
@@ -137,6 +158,119 @@ impl CursorApi {
             .json()
             .await
             .map_err(|e| ProviderError::Parse(e.to_string()))
+    }
+
+    async fn fetch_usage_from_cursor_ide(&self) -> Result<CursorUsageResult, ProviderError> {
+        let session = Self::read_cursor_ide_session()?;
+        let (usage_result, me_result) = tokio::join!(
+            self.fetch_dashboard_current_period_usage(&session.access_token),
+            self.fetch_dashboard_me(&session.access_token)
+        );
+
+        self.build_dashboard_result(
+            usage_result?,
+            me_result.ok().and_then(|me| me.email).or(session.email),
+            session.membership_type,
+        )
+    }
+
+    async fn fetch_dashboard_current_period_usage(
+        &self,
+        access_token: &str,
+    ) -> Result<DashboardCurrentPeriodUsage, ProviderError> {
+        self.post_dashboard_json("GetCurrentPeriodUsage", access_token, serde_json::json!({}))
+            .await
+    }
+
+    async fn fetch_dashboard_me(&self, access_token: &str) -> Result<DashboardMe, ProviderError> {
+        self.post_dashboard_json("GetMe", access_token, serde_json::json!({}))
+            .await
+    }
+
+    async fn post_dashboard_json<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        access_token: &str,
+        body: serde_json::Value,
+    ) -> Result<T, ProviderError> {
+        let url = format!("{DASHBOARD_BASE_URL}/{method}");
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(access_token)
+            .header("Connect-Protocol-Version", "1")
+            .header("Accept", "application/json")
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await?;
+
+        if response.status() == 401 || response.status() == 403 {
+            return Err(ProviderError::AuthRequired);
+        }
+
+        if !response.status().is_success() {
+            return Err(ProviderError::Other(format!(
+                "Cursor Dashboard API returned {}",
+                response.status()
+            )));
+        }
+
+        response
+            .json()
+            .await
+            .map_err(|e| ProviderError::Parse(e.to_string()))
+    }
+
+    fn build_dashboard_result(
+        &self,
+        usage: DashboardCurrentPeriodUsage,
+        email: Option<String>,
+        membership_type: Option<String>,
+    ) -> Result<CursorUsageResult, ProviderError> {
+        let billing_end = usage
+            .billing_cycle_end
+            .as_deref()
+            .and_then(parse_unix_millis)
+            .or_else(|| usage.billing_cycle_end.as_deref().and_then(parse_iso_date));
+
+        let plan = usage.plan_usage.unwrap_or_default();
+        let primary = RateWindow::with_details(
+            dashboard_percent(plan.total_percent_used).unwrap_or(0.0),
+            None,
+            billing_end,
+            None,
+        );
+        let secondary = dashboard_percent(plan.auto_percent_used)
+            .map(|percent| RateWindow::with_details(percent, None, billing_end, None));
+        let model_specific = dashboard_percent(plan.api_percent_used)
+            .map(|percent| RateWindow::with_details(percent, None, billing_end, None));
+
+        let plan_type = membership_type
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("Cursor {}", capitalize(&value.to_lowercase())));
+
+        Ok((primary, secondary, model_specific, None, email, plan_type))
+    }
+
+    fn read_cursor_ide_session() -> Result<CursorIdeSession, ProviderError> {
+        let db_path = cursor_state_db_path().ok_or_else(|| {
+            ProviderError::NotInstalled(
+                "Could not resolve Cursor application data path.".to_string(),
+            )
+        })?;
+
+        if !db_path.exists() {
+            return Err(ProviderError::NotInstalled(format!(
+                "Cursor IDE state database not found at {}. Open Cursor and sign in first.",
+                db_path.display()
+            )));
+        }
+
+        let temp_db = copy_state_db_to_temp(&db_path)?;
+        let result = read_cursor_ide_session_from_db(&temp_db);
+        let _ = std::fs::remove_file(&temp_db);
+        result
     }
 
     fn build_result(
@@ -333,7 +467,90 @@ struct UserInfo {
     picture: Option<String>,
 }
 
+#[derive(Debug)]
+struct CursorIdeSession {
+    access_token: String,
+    email: Option<String>,
+    membership_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardCurrentPeriodUsage {
+    billing_cycle_end: Option<String>,
+    plan_usage: Option<DashboardPlanUsage>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardPlanUsage {
+    auto_percent_used: Option<f64>,
+    api_percent_used: Option<f64>,
+    total_percent_used: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardMe {
+    email: Option<String>,
+}
+
 // --- Helper functions ---
+
+fn cursor_state_db_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("CURSOR_STATE_DB")
+        && !path.trim().is_empty()
+    {
+        return Some(PathBuf::from(path));
+    }
+
+    dirs::data_dir().map(|base| {
+        base.join("Cursor")
+            .join("User")
+            .join("globalStorage")
+            .join("state.vscdb")
+    })
+}
+
+fn copy_state_db_to_temp(path: &Path) -> Result<PathBuf, ProviderError> {
+    let temp_path = std::env::temp_dir().join(format!(
+        "codexbar-cursor-state-{}.vscdb",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::copy(path, &temp_path).map_err(|e| {
+        ProviderError::Other(format!(
+            "Failed to copy Cursor IDE state database for reading: {e}"
+        ))
+    })?;
+    Ok(temp_path)
+}
+
+fn read_cursor_ide_session_from_db(db_path: &Path) -> Result<CursorIdeSession, ProviderError> {
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| ProviderError::Other(format!("Failed to open Cursor IDE state: {e}")))?;
+    conn.busy_timeout(std::time::Duration::from_millis(250))
+        .map_err(|e| ProviderError::Other(format!("Failed to configure SQLite timeout: {e}")))?;
+
+    let access_token = read_state_value(&conn, CURSOR_ACCESS_TOKEN_KEY)?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(ProviderError::AuthRequired)?;
+
+    Ok(CursorIdeSession {
+        access_token,
+        email: read_state_value(&conn, CURSOR_EMAIL_KEY)?,
+        membership_type: read_state_value(&conn, CURSOR_MEMBERSHIP_KEY)?,
+    })
+}
+
+fn read_state_value(conn: &Connection, key: &str) -> Result<Option<String>, ProviderError> {
+    conn.query_row(
+        "SELECT value FROM ItemTable WHERE key = ?1 LIMIT 1",
+        [key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| ProviderError::Other(format!("Failed to read Cursor IDE state: {e}")))
+}
 
 fn parse_iso_date(s: &str) -> Option<DateTime<Utc>> {
     // Try with fractional seconds
@@ -347,6 +564,23 @@ fn parse_iso_date(s: &str) -> Option<DateTime<Utc>> {
     }
 
     None
+}
+
+fn parse_unix_millis(s: &str) -> Option<DateTime<Utc>> {
+    s.parse::<i64>()
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+}
+
+fn dashboard_percent(value: Option<f64>) -> Option<f64> {
+    value.map(|percent| {
+        if percent <= 1.0 {
+            percent * 100.0
+        } else {
+            percent
+        }
+        .clamp(0.0, 100.0)
+    })
 }
 
 fn capitalize(s: &str) -> String {
@@ -442,6 +676,62 @@ mod tests {
         assert!(secondary.is_none());
         assert!(model_specific.is_none());
         assert!(cost.is_none());
+    }
+
+    #[test]
+    fn test_cursor_dashboard_result_from_ide_payload() {
+        let usage = DashboardCurrentPeriodUsage {
+            billing_cycle_end: Some("1781084981975".into()),
+            plan_usage: Some(DashboardPlanUsage {
+                total_percent_used: Some(42.0),
+                auto_percent_used: Some(0.25),
+                api_percent_used: Some(12.0),
+            }),
+        };
+
+        let (primary, secondary, model_specific, cost, email, plan_type) = api()
+            .build_dashboard_result(usage, Some("user@example.com".into()), Some("pro".into()))
+            .unwrap();
+
+        assert!((primary.used_percent - 42.0).abs() < 0.01);
+        assert!(primary.resets_at.is_some());
+        assert!((secondary.unwrap().used_percent - 25.0).abs() < 0.01);
+        assert!((model_specific.unwrap().used_percent - 12.0).abs() < 0.01);
+        assert!(cost.is_none());
+        assert_eq!(email.as_deref(), Some("user@example.com"));
+        assert_eq!(plan_type.as_deref(), Some("Cursor Pro"));
+    }
+
+    #[test]
+    fn test_reads_cursor_ide_session_from_state_db() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let conn = rusqlite::Connection::open(temp.path()).unwrap();
+        conn.execute(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            [CURSOR_ACCESS_TOKEN_KEY, "access-token"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            [CURSOR_EMAIL_KEY, "user@example.com"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            [CURSOR_MEMBERSHIP_KEY, "pro"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let session = read_cursor_ide_session_from_db(temp.path()).unwrap();
+        assert_eq!(session.access_token, "access-token");
+        assert_eq!(session.email.as_deref(), Some("user@example.com"));
+        assert_eq!(session.membership_type.as_deref(), Some("pro"));
     }
 
     #[test]

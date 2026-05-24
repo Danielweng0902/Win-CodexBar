@@ -309,13 +309,13 @@ impl ClaudeProvider {
         }
 
         if let Some(result) =
-            record_auto_source(&mut failures, "Web", self.fetch_via_web(ctx).await)
+            record_auto_source(&mut failures, "OAuth", self.fetch_via_oauth(ctx).await)
         {
             return Ok(result);
         }
 
         if let Some(result) =
-            record_auto_source(&mut failures, "OAuth", self.fetch_via_oauth(ctx).await)
+            record_auto_source(&mut failures, "Web", self.fetch_via_web(ctx).await)
         {
             return Ok(result);
         }

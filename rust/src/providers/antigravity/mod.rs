@@ -121,47 +121,6 @@ impl AntigravityProvider {
         }
     }
 
-    /// Find the actual API endpoint by checking listening ports
-    async fn find_api_endpoint(process_info: &ProcessInfo) -> Result<ApiEndpoint, ProviderError> {
-        // The language server listens on multiple ports near the extension port
-        // and sometimes on ports owned by the language-server process but far
-        // away from the extension-server port.
-        // SECURITY: TLS verification is disabled because the local language server uses
-        // self-signed certificates. This is scoped to 127.0.0.1 only. We verify
-        // the server responds with the expected gRPC endpoint.
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(900))
-            .danger_accept_invalid_certs(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| ProviderError::Other(e.to_string()))?;
-
-        for port in candidate_api_ports(process_info) {
-            for scheme in ["https", "http"] {
-                let url = format!(
-                    "{}://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/GetUnleashData",
-                    scheme, port
-                );
-
-                if let Ok(resp) = client
-                    .post(&url)
-                    .header("Content-Type", "application/json")
-                    .header("Connect-Protocol-Version", "1")
-                    .body("{}")
-                    .send()
-                    .await
-                    && (resp.status().as_u16() == 200 || resp.status().as_u16() == 401)
-                {
-                    return Ok(ApiEndpoint { scheme, port });
-                }
-            }
-        }
-
-        Err(ProviderError::Other(
-            "Could not find Antigravity API port".to_string(),
-        ))
-    }
-
     /// Fetch user status from Antigravity API
     async fn fetch_user_status(&self) -> Result<UsageSnapshot, ProviderError> {
         let process_infos = Self::detect_process_infos()?;
@@ -191,20 +150,13 @@ impl AntigravityProvider {
         &self,
         process_info: &ProcessInfo,
     ) -> Result<UsageSnapshot, ProviderError> {
-        let api_endpoint = Self::find_api_endpoint(process_info).await?;
-
-        // SECURITY: TLS verification disabled for local language server (see find_api_port)
+        // SECURITY: TLS verification disabled for the local language server.
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(8))
+            .timeout(std::time::Duration::from_millis(1500))
             .danger_accept_invalid_certs(true)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
-
-        let url = format!(
-            "{}://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/GetUserStatus",
-            api_endpoint.scheme, api_endpoint.port
-        );
 
         let body = serde_json::json!({
             "metadata": {
@@ -215,59 +167,55 @@ impl AntigravityProvider {
             }
         });
 
-        // Use extension server CSRF token if available, otherwise fall back to language server token
-        let csrf_token = process_info
-            .extension_server_csrf_token
-            .as_deref()
-            .unwrap_or(&process_info.csrf_token);
+        let mut failures = Vec::new();
+        for port in candidate_api_ports(process_info) {
+            for scheme in ["https", "http"] {
+                let url = format!(
+                    "{}://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/GetUserStatus",
+                    scheme, port
+                );
 
-        let resp = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Connect-Protocol-Version", "1")
-            .header("X-Codeium-Csrf-Token", csrf_token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other(format!("API request failed: {}", e)))?;
+                for (token_kind, csrf_token) in csrf_token_candidates(process_info) {
+                    let resp = client
+                        .post(&url)
+                        .header("Content-Type", "application/json")
+                        .header("Connect-Protocol-Version", "1")
+                        .header("X-Codeium-Csrf-Token", csrf_token)
+                        .json(&body)
+                        .send()
+                        .await;
 
-        if !resp.status().is_success() {
-            // Retry with language server CSRF token if extension server token failed
-            if process_info.extension_server_csrf_token.is_some() {
-                let retry_resp = client
-                    .post(&url)
-                    .header("Content-Type", "application/json")
-                    .header("Connect-Protocol-Version", "1")
-                    .header("X-Codeium-Csrf-Token", &process_info.csrf_token)
-                    .json(&body)
-                    .send()
-                    .await;
-
-                if let Ok(retry) = retry_resp
-                    && retry.status().is_success()
-                {
-                    let json: UserStatusResponse = retry
-                        .json()
-                        .await
-                        .map_err(|e| ProviderError::Parse(e.to_string()))?;
-                    return self.parse_user_status(json);
+                    match resp {
+                        Ok(resp) if resp.status().is_success() => {
+                            let json: UserStatusResponse = resp
+                                .json()
+                                .await
+                                .map_err(|e| ProviderError::Parse(e.to_string()))?;
+                            return self.parse_user_status(json);
+                        }
+                        Ok(resp) => {
+                            let status = resp.status();
+                            let text = resp.text().await.unwrap_or_default();
+                            push_probe_failure(
+                                &mut failures,
+                                format!("{scheme}:{port} {token_kind} -> {status}: {text}"),
+                            );
+                        }
+                        Err(error) => {
+                            push_probe_failure(
+                                &mut failures,
+                                format!("{scheme}:{port} {token_kind} -> {error}"),
+                            );
+                        }
+                    }
                 }
             }
-
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Other(format!(
-                "API error {}: {}",
-                status, text
-            )));
         }
 
-        let json: UserStatusResponse = resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::Other(format!("Failed to parse response: {}", e)))?;
-
-        self.parse_user_status(json)
+        Err(ProviderError::Other(format!(
+            "Could not fetch Antigravity user status from detected language server. {}",
+            failures.join("; ")
+        )))
     }
 
     fn parse_user_status(
@@ -384,11 +332,6 @@ struct ProcessInfo {
     extension_port: u16,
 }
 
-struct ApiEndpoint {
-    scheme: &'static str,
-    port: u16,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct DetectedProcess {
@@ -437,6 +380,23 @@ fn dedup_ports(ports: Vec<u16>) -> Vec<u16> {
         }
     }
     out
+}
+
+fn csrf_token_candidates(process_info: &ProcessInfo) -> Vec<(&'static str, &str)> {
+    let mut tokens = vec![("language", process_info.csrf_token.as_str())];
+    if let Some(extension) = process_info.extension_server_csrf_token.as_deref()
+        && extension != process_info.csrf_token
+    {
+        tokens.push(("extension", extension));
+    }
+    tokens
+}
+
+fn push_probe_failure(failures: &mut Vec<String>, failure: String) {
+    const MAX_FAILURES: usize = 8;
+    if failures.len() < MAX_FAILURES {
+        failures.push(failure);
+    }
 }
 
 #[cfg(windows)]
