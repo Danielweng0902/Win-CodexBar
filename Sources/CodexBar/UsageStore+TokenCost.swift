@@ -133,6 +133,15 @@ extension UsageStore {
         return !piIsCostSource
     }
 
+    /// Provider-specific by design: only the ambient Codex ledger may merge machine-local
+    /// OpenCode history; scoped homes and every other provider stay excluded, and the source
+    /// is opt-in and default-off (#3273 contract).
+    func shouldIncludeOpenCodeLocalHistoryInTokenSnapshot(for provider: UsageProvider) -> Bool {
+        guard provider == .codex else { return false }
+        if self.tokenCostScope(for: provider).codexHomePath != nil { return false }
+        return self.settings.codexIncludeOpenCodeLocalHistory
+    }
+
     func piRowsScopeSignature(for provider: UsageProvider) -> String? {
         guard provider == .claude ||
             (provider == .codex && self.tokenCostScope(for: provider).codexHomePath == nil)
@@ -148,6 +157,7 @@ extension UsageStore {
         historyDays: Int,
         cursorCookieHeaderOverride: String? = nil,
         includePiSessions: Bool = true,
+        includeOpenCodeLocalHistory: Bool = false,
         reportContext: CostUsageReportContext = .regular) async throws -> CostUsageTokenResult
     {
         if let override = self._test_tokenUsageResultLoaderOverride {
@@ -196,6 +206,7 @@ extension UsageStore {
                     cursorCookieHeaderOverride: cursorCookieHeaderOverride,
                     allowPricingRefresh: allowPricingRefresh,
                     includePiSessions: effectiveIncludePiSessions,
+                    includeOpenCodeLocalHistory: includeOpenCodeLocalHistory,
                     piSessionProcessContexts: piSessionProcessContexts,
                     bypassScannerDebounce: true,
                     calendar: self.settings.costUsageBucketCalendar,
@@ -411,6 +422,7 @@ extension UsageStore {
                     codexHomePath: scope.codexHomePath,
                     historyDays: historyDays,
                     includePiSessions: includePiSessions,
+                    includeOpenCodeLocalHistory: self.shouldIncludeOpenCodeLocalHistoryInTokenSnapshot(for: .codex),
                     calendar: self.settings.costUsageBucketCalendar,
                     environment: self.environmentBase)
                     .map {
@@ -533,6 +545,10 @@ extension UsageStore {
     {
         let scope = self.tokenCostScope(for: provider)
         var base = "\(scope.signature)|historyDays=\(historyDays)"
+        // Provider-specific by design: only Codex's ambient ledger carries the opt-in OpenCode local source.
+        if provider == .codex {
+            base += "|openCodeLocal=\(self.shouldIncludeOpenCodeLocalHistoryInTokenSnapshot(for: provider) ? "1" : "0")"
+        }
         if self.usesPiHistoryScope(provider) {
             base += "|piHistoryGeneration=\(self.piHistoryScopeGeneration)"
         }

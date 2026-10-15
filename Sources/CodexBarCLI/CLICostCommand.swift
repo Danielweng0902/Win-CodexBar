@@ -124,6 +124,7 @@ extension CodexBarCLI {
                         groupBy: groupBy,
                         format: format,
                         includePiSessions: includePiSessions),
+                    includeOpenCodeLocalHistory: Self.costIncludeOpenCodeLocalHistory(provider: provider),
                     piSessionProcessContexts: piSessionProcessContexts).reporting(period)
                 switch format {
                 case .text:
@@ -864,6 +865,12 @@ extension CodexBarCLI {
 
     static func decodeCostIncludePiSessions(from values: ParsedValues) -> Bool {
         !values.flags.contains("providerNativeOnly")
+    }
+
+    /// Provider-specific by design: machine-local OpenCode history joins only the ambient Codex
+    /// cost report, behind the same default-off app setting the menu uses (#3273 contract).
+    static func costIncludeOpenCodeLocalHistory(provider: UsageProvider) -> Bool {
+        provider == .codex && (boolFromAppDefaults("codexIncludeOpenCodeLocalHistory") ?? false)
     }
 
     static func decodeCostGroupBy(from values: ParsedValues) -> CostGroupBy {

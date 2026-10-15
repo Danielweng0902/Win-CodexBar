@@ -1530,7 +1530,8 @@ extension UsageStore {
                 codexHomePath: costScope.codexHomePath,
                 historyDays: historyDays,
                 cursorCookieHeaderOverride: cursorCookieHeaderOverride,
-                includePiSessions: self.shouldIncludePiSessionsInTokenSnapshot(for: provider))
+                includePiSessions: self.shouldIncludePiSessionsInTokenSnapshot(for: provider),
+                includeOpenCodeLocalHistory: self.shouldIncludeOpenCodeLocalHistoryInTokenSnapshot(for: provider))
             try self.commitTokenUsageResult(result, context: refreshContext)
         } catch {
             guard self.tokenRefreshPublicationDisposition(
