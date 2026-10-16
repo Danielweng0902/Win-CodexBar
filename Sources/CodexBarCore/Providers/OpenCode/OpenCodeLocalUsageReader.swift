@@ -52,33 +52,30 @@ public struct OpenCodeLocalUsageReader: Sendable {
             .appendingPathComponent("share", isDirectory: true)
     }
 
-    /// Resolves the database OpenCode itself would use, mirroring upstream `database.path()`:
-    /// `OPENCODE_DB` wins (absolute as-is, relative to the data directory); otherwise the
-    /// channel-specific `opencode-<channel>.db` unless the channel is `latest`/`beta`/`prod`
-    /// or channel databases are disabled; otherwise `opencode.db`.
+    /// Resolves the single database OpenCode itself would use, mirroring upstream
+    /// `database.path()`: `OPENCODE_DB` selects exactly one database (`:memory:` is in-memory
+    /// history an on-disk reader cannot see; absolute paths win as-is; relative names resolve
+    /// inside the data directory) and is never substituted with another database. Without an
+    /// explicit selection, upstream derives the channel from a build-time constant
+    /// (`InstallationChannel`), which an external reader cannot observe — release channels
+    /// (`latest`/`beta`/`prod`) and the `OPENCODE_DISABLE_CHANNEL_DB` opt-out both select the
+    /// plain database, so that is the contract's selection here. Non-release channel
+    /// databases stay reachable through `OPENCODE_DB`, exactly like pointing OpenCode itself
+    /// at them.
     public static func candidateDatabaseURLs(
         dataDirectory: URL,
         environment: [String: String]) -> [URL]
     {
-        if let override = Self.cleaned(environment["OPENCODE_DB"]), override != ":memory:" {
+        if let override = Self.cleaned(environment["OPENCODE_DB"]) {
+            if override == ":memory:" {
+                return []
+            }
             if override.hasPrefix("/") {
                 return [URL(fileURLWithPath: override)]
             }
             return [dataDirectory.appendingPathComponent(override, isDirectory: false)]
         }
-        let defaultURL = dataDirectory.appendingPathComponent("opencode.db", isDirectory: false)
-        let channelDatabaseIsDisabled = environment["OPENCODE_DISABLE_CHANNEL_DB"] == "1" ||
-            environment["OPENCODE_DISABLE_CHANNEL_DB"] == "true"
-        guard !channelDatabaseIsDisabled,
-              let channel = Self.cleaned(environment["OPENCODE_UPDATE_CHANNEL"]),
-              !["latest", "beta", "prod"].contains(channel.lowercased())
-        else {
-            return [defaultURL]
-        }
-        let sanitized = String(channel.map { character in
-            character.isLetter || character.isNumber || ".-_".contains(character) ? character : "-"
-        })
-        return [dataDirectory.appendingPathComponent("opencode-\(sanitized).db", isDirectory: false), defaultURL]
+        return [dataDirectory.appendingPathComponent("opencode.db", isDirectory: false)]
     }
 
     private static func cleaned(_ value: String?) -> String? {
@@ -133,7 +130,12 @@ public struct OpenCodeLocalUsageReader: Sendable {
             : databaseURL.path
         let flags = immutable ? SQLITE_OPEN_READONLY | SQLITE_OPEN_URI : SQLITE_OPEN_READONLY
         let openResult = sqlite3_open_v2(filename, &db, flags, nil)
-        guard openResult == SQLITE_OK else {
+        guard openResult == SQLITE_OK, db != nil else {
+            // sqlite3_open_v2 can return a non-null connection handle even on failure;
+            // close it before throwing so every refresh-failure path releases it.
+            if let db {
+                _ = sqlite3_close(db)
+            }
             throw Self.sqliteFailure(db: db, resultCode: openResult)
         }
         defer { sqlite3_close(db) }
@@ -385,7 +387,9 @@ public struct OpenCodeLocalUsageReader: Sendable {
                 requestCount: 1,
                 costUSD: row.cost,
                 modelsUsed: [model],
-                modelBreakdowns: [breakdown])
+                modelBreakdowns: [breakdown],
+                // The cost comes from OpenCode's own records, not list-price estimation.
+                costIsSourceRecorded: true)
         }
     }
 }

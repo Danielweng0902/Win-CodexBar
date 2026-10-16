@@ -37,6 +37,60 @@ struct OpenCodeLocalHistoryMergeTests {
         // Rows keep a visible source label instead of silently merging into native totals.
         let model = try #require(merged.snapshot.daily.first?.modelsUsed?.first)
         #expect(model.hasSuffix("(OpenCode local)"))
+        // Grouped accounting carries the rows: the unattributed bucket holds the OpenCode
+        // daily data, and session breakdowns stay native (empty here, no native sessions).
+        let unattributed = try #require(
+            merged.snapshot.projects.first { $0.name == CostUsageProjectBreakdown.unknownProjectName })
+        #expect(unattributed.daily.first?.totalTokens == 35)
+        #expect(merged.snapshot.sessions.isEmpty)
+        // Only recorded rows are present, so the snapshot must not claim list-price estimation.
+        #expect(merged.snapshot.costProvenance == .sourceRecorded)
+    }
+
+    @Test
+    func `mixed history separates recorded costs from the list-price claim`() async throws {
+        let env = try CostUsageTestEnvironment()
+        defer { env.cleanup() }
+        let day = try env.makeLocalNoon(year: 2026, month: 4, day: 8)
+        let databaseURL = try Self.makeOpenCodeDatabase(root: env.root, day: day)
+        try Self.writeNativeCodexSession(env: env, day: day, filename: "mixed-native.jsonl", tokens: 100)
+
+        var scannerOptions = CostUsageScanner.Options(
+            codexSessionsRoot: env.codexSessionsRoot,
+            cacheRoot: env.cacheRoot,
+            codexTraceDatabaseURL: env.root.appendingPathComponent("missing-traces.sqlite"))
+        scannerOptions.refreshMinIntervalSeconds = 0
+        let merged = try await CostUsageFetcher.loadTokenResult(
+            provider: .codex,
+            environment: [
+                "OPENCODE_DB": databaseURL.path,
+                "HOME": env.root.path,
+            ],
+            now: day,
+            historyDays: 1,
+            allowPricingRefresh: false,
+            includePiSessions: false,
+            includeOpenCodeLocalHistory: true,
+            scannerOptions: scannerOptions)
+
+        // Native (estimated) and OpenCode (recorded) rows both contribute.
+        #expect(merged.snapshot.last30DaysTokens == 135)
+        // Grouped totals keep both: the native project and the unattributed bucket.
+        let nativeProject = try #require(merged.snapshot.projects.first {
+            $0.name != CostUsageProjectBreakdown.unknownProjectName
+        })
+        #expect(nativeProject.totalTokens == 100)
+        let unattributed = try #require(
+            merged.snapshot.projects.first { $0.name == CostUsageProjectBreakdown.unknownProjectName })
+        #expect(unattributed.totalTokens == 35)
+        // Session breakdowns cannot attribute OpenCode rows and stay native.
+        #expect(merged.snapshot.sessions.isEmpty)
+        // The window mixes estimated and recorded costs; a pure list-price claim would be false.
+        #expect(merged.snapshot.costProvenance == .mixed)
+        let window = merged.snapshot.summary(forLastDays: 1, calendar: scannerOptions.calendar)
+        #expect(window.provenance == .mixed)
+        // Per-day entries keep the recorded marker so cached windows stay truthful too.
+        #expect(merged.snapshot.daily.contains { $0.costIsSourceRecorded })
     }
 
     @Test
@@ -174,6 +228,12 @@ struct OpenCodeLocalHistoryMergeTests {
             scannerOptions: options,
             environment: ["OPENCODE_DB": databaseURL.path])
         #expect(merged?.snapshot.last30DaysTokens == 35)
+        // Catch-up publication converges on the same grouped accounting and provenance.
+        #expect(merged?.snapshot.costProvenance == .sourceRecorded)
+        #expect(merged?.snapshot.projects.contains {
+            $0.name == CostUsageProjectBreakdown.unknownProjectName
+        } == true)
+        #expect(merged?.snapshot.sessions.isEmpty == true)
 
         let native = await CostUsageFetcher.loadCachedCodexTokenSnapshotResult(
             now: day,
@@ -182,6 +242,7 @@ struct OpenCodeLocalHistoryMergeTests {
             scannerOptions: options,
             environment: ["OPENCODE_DB": databaseURL.path])
         #expect(native?.snapshot.last30DaysTokens == 0)
+        #expect(native?.snapshot.costProvenance == .listPriceEstimate)
     }
 
     @Test
@@ -255,6 +316,87 @@ struct OpenCodeLocalHistoryMergeTests {
                 "CODEX_HOME": selectedHome.path,
             ])
         #expect((scoped?.snapshot.last30DaysTokens ?? 0) == 0)
+    }
+
+    @Test
+    func `entries persisted before this feature decode without the recorded marker`() throws {
+        // A pre-feature cache entry carries every field this feature reads, plus none of the
+        // new ones. Upgrading must keep that stored data loading instead of discarding it.
+        let legacyJSON = """
+        {
+          "date": "2026-04-08",
+          "inputTokens": 30,
+          "outputTokens": 5,
+          "totalTokens": 35,
+          "requestCount": 1,
+          "costUSD": 0.5,
+          "modelsUsed": ["gpt-5.1-codex"],
+          "modelBreakdowns": [
+            {"modelName": "gpt-5.1-codex", "costUSD": 0.5, "totalTokens": 35, "requestCount": 1}
+          ]
+        }
+        """
+        let entry = try JSONDecoder().decode(
+            CostUsageDailyReport.Entry.self, from: Data(legacyJSON.utf8))
+        #expect(entry.totalTokens == 35)
+        #expect(entry.costUSD == 0.5)
+        #expect(entry.costIsSourceRecorded == false)
+        // Re-encoding round-trips the new field so refreshed caches stay self-describing.
+        let reencoded = try JSONDecoder().decode(
+            CostUsageDailyReport.Entry.self, from: JSONEncoder().encode(entry))
+        #expect(reencoded == entry)
+    }
+
+    /// Writes one native Codex JSONL session with the given token count, so mixed-history
+    /// tests can assert how estimated and recorded rows combine.
+    private static func writeNativeCodexSession(
+        env: CostUsageTestEnvironment,
+        day: Date,
+        filename: String,
+        tokens: Int) throws
+    {
+        var partition = Calendar(identifier: .gregorian)
+        partition.timeZone = TimeZone(identifier: "UTC") ?? .current
+        let components = partition.dateComponents([.year, .month, .day], from: day)
+        let directory = env.codexSessionsRoot
+            .appendingPathComponent(String(format: "%04d", components.year ?? 1970), isDirectory: true)
+            .appendingPathComponent(String(format: "%02d", components.month ?? 1), isDirectory: true)
+            .appendingPathComponent(String(format: "%02d", components.day ?? 1), isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let model = "gpt-5.4"
+        try env.jsonl([
+            [
+                "type": "session_meta",
+                "timestamp": env.isoString(for: day.addingTimeInterval(-2)),
+                "payload": [
+                    "id": "opencode-merge-\(filename)",
+                    "cwd": env.root.appendingPathComponent("merge-project", isDirectory: true).path,
+                ],
+            ],
+            [
+                "type": "turn_context",
+                "timestamp": env.isoString(for: day.addingTimeInterval(-1)),
+                "payload": ["model": model, "turn_id": "opencode-merge-turn"],
+            ],
+            [
+                "type": "event_msg",
+                "timestamp": env.isoString(for: day),
+                "payload": [
+                    "type": "token_count",
+                    "info": [
+                        "model": model,
+                        "last_token_usage": [
+                            "input_tokens": tokens,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 0,
+                        ],
+                    ],
+                ],
+            ],
+        ]).write(
+            to: directory.appendingPathComponent(filename, isDirectory: false),
+            atomically: true,
+            encoding: .utf8)
     }
 
     /// Builds an OpenCode SQLite database with one `openai` assistant record (35 tokens,

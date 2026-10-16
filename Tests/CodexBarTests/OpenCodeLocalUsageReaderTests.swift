@@ -278,12 +278,14 @@ struct OpenCodeLocalUsageReaderTests {
     }
 
     @Test
-    func `channel database candidates are ordered before the default`() {
+    func `selection follows the upstream single database contract`() {
         let dataDirectory = URL(fileURLWithPath: "/tmp/opencode-data", isDirectory: true)
-        let candidates = OpenCodeLocalUsageReader.candidateDatabaseURLs(
+        // No explicit selection: the release database, regardless of environment channel
+        // hints (upstream derives the channel from a build constant, not the environment).
+        let plain = OpenCodeLocalUsageReader.candidateDatabaseURLs(
             dataDirectory: dataDirectory,
             environment: ["OPENCODE_UPDATE_CHANNEL": "canary"])
-        #expect(candidates.map(\.lastPathComponent) == ["opencode-canary.db", "opencode.db"])
+        #expect(plain.map(\.lastPathComponent) == ["opencode.db"])
 
         let disabled = OpenCodeLocalUsageReader.candidateDatabaseURLs(
             dataDirectory: dataDirectory,
@@ -295,10 +297,45 @@ struct OpenCodeLocalUsageReaderTests {
             environment: ["OPENCODE_UPDATE_CHANNEL": "latest"])
         #expect(stable.map(\.lastPathComponent) == ["opencode.db"])
 
+        // Explicit selections are never substituted: one database, exactly as requested.
         let relative = OpenCodeLocalUsageReader.candidateDatabaseURLs(
             dataDirectory: dataDirectory,
             environment: ["OPENCODE_DB": "custom.db"])
         #expect(relative.map(\.lastPathComponent) == ["custom.db"])
+
+        let absolute = OpenCodeLocalUsageReader.candidateDatabaseURLs(
+            dataDirectory: dataDirectory,
+            environment: ["OPENCODE_DB": "/elsewhere/open.db"])
+        #expect(absolute.map(\.path) == ["/elsewhere/open.db"])
+
+        // In-memory history lives off disk; an on-disk reader sees nothing and must not
+        // silently substitute the stable database.
+        let memory = OpenCodeLocalUsageReader.candidateDatabaseURLs(
+            dataDirectory: dataDirectory,
+            environment: ["OPENCODE_DB": ":memory:"])
+        #expect(memory.isEmpty)
+    }
+
+    @Test
+    func `an explicit selection is never substituted with the default database`() throws {
+        let env = try Self.makeEnvironment()
+        defer { try? FileManager.default.removeItem(at: env.root) }
+        // The default database holds rows, but the explicitly selected one does not.
+        try Self.createDatabase(at: env.databaseURL)
+        let now = Date(timeIntervalSince1970: 1_772_798_400)
+        try Self.insertMessage(
+            databaseURL: env.databaseURL, createdMs: Self.ms(now), cost: 1,
+            model: "gpt-5.1-codex", providerID: "openai")
+        let selectedDirectory = env.root.appendingPathComponent("selected", isDirectory: true)
+        try FileManager.default.createDirectory(at: selectedDirectory, withIntermediateDirectories: true)
+        let selectedURL = selectedDirectory.appendingPathComponent("opencode.db", isDirectory: false)
+        try Self.createDatabase(at: selectedURL)
+
+        let reader = OpenCodeLocalUsageReader(databaseURLs: OpenCodeLocalUsageReader.candidateDatabaseURLs(
+            dataDirectory: env.databaseURL.deletingLastPathComponent(),
+            environment: ["OPENCODE_DB": selectedURL.path]))
+        #expect(try reader.loadDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current) == nil)
     }
 
     @Test
@@ -306,9 +343,14 @@ struct OpenCodeLocalUsageReaderTests {
         let env = try Self.makeEnvironment()
         defer { try? FileManager.default.removeItem(at: env.root) }
         try Self.createDatabase(at: env.databaseURL)
-        // 2026-10-16 15:00 local; the row landed at 10:00 the same day.
-        let now = Date(timeIntervalSince1970: 1_772_798_400)
-        let morning = now.addingTimeInterval(-5 * 3600)
+        // Pin the calendar so the test is independent of the host time zone: 2026-03-06
+        // 15:00 UTC with the row at 10:00 UTC the same day.
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC") ?? .current
+        let now = try #require(utc.date(from: DateComponents(
+            year: 2026, month: 3, day: 6, hour: 15, minute: 0)))
+        let morning = try #require(utc.date(from: DateComponents(
+            year: 2026, month: 3, day: 6, hour: 10, minute: 0)))
         try Self.insertMessage(
             databaseURL: env.databaseURL, createdMs: Self.ms(morning), cost: 1,
             model: "gpt-5.1-codex", providerID: "openai")
@@ -316,7 +358,7 @@ struct OpenCodeLocalUsageReaderTests {
         // A `now`-anchored one-hour window must still include the morning row once the
         // lower bound is normalized to the reporting day's start.
         let loaded = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
-            .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+            .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: utc)
         let result = try #require(loaded)
         #expect(result.data.first?.requestCount == 1)
     }

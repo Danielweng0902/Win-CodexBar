@@ -805,7 +805,7 @@ public struct CostUsageFetcher: Sendable {
             historyCoverageIsEstablished: scanResult.inclusive.historyCoverageIsEstablished,
             historyScanIsPartial: scanResult.native.historyCoverageIsEstablished
                 && !scanResult.inclusive.historyCoverageIsEstablished,
-            costProvenance: .listPriceEstimate,
+            costProvenance: scanResult.costProvenance,
             projects: scanResult.inclusive.projects,
             sessions: scanResult.inclusive.sessions,
             detailsAreComplete: scanResult.inclusive.detailsAreComplete,
@@ -844,6 +844,8 @@ public struct CostUsageFetcher: Sendable {
         let inclusive: LocalTokenScanReport
         let native: LocalTokenScanReport
         let piScope: String?
+        /// Provenance of the inclusive report's costs; the native projection stays list-price.
+        let costProvenance: CostProvenance
     }
 
     /// Provider-specific by design: machine-local OpenCode history joins only scans whose
@@ -994,6 +996,8 @@ public struct CostUsageFetcher: Sendable {
                     [daily, piScanResult.report],
                     calendar: options.scanOptions.calendar)
             }
+            var openCodeLocalReport: CostUsageDailyReport?
+            let listPriceHistoryPresent = !daily.data.isEmpty
             if options.shouldMergeOpenCodeLocalUsage {
                 // Provider-specific by design: this optional merge reads machine-local OpenCode
                 // history for OpenAI-provider assistant records into the ambient Codex ledger.
@@ -1005,11 +1009,26 @@ public struct CostUsageFetcher: Sendable {
                     daily = CostUsageDailyReport.merged(
                         [daily, openCode],
                         calendar: options.scanOptions.calendar)
+                    openCodeLocalReport = openCode
+                }
+            }
+            if let openCodeLocalReport {
+                // Provider-specific by design: OpenCode rows carry no Codex project or session
+                // attribution, so they join the unattributed bucket the Pi merge established.
+                // Session breakdowns stay native (they cannot attribute these rows).
+                if let project = Self.unknownProjectBreakdown(from: openCodeLocalReport) {
+                    projects.append(project)
+                    sessions = []
                 }
             }
             if provider == .codex {
                 projects = Self.mergedProjectBreakdowns(projects)
             }
+            // Recorded OpenCode costs must not surface under a pure list-price claim:
+            // mixed when estimated rows coexist, sourceRecorded when only OpenCode rows exist.
+            let inclusiveCostProvenance: CostProvenance = openCodeLocalReport != nil
+                ? (listPriceHistoryPresent ? .mixed : .sourceRecorded)
+                : .listPriceEstimate
             return LocalTokenScanResult(
                 inclusive: LocalTokenScanReport(
                     daily: daily,
@@ -1019,7 +1038,8 @@ public struct CostUsageFetcher: Sendable {
                     historyCoverageIsEstablished: native.historyCoverageIsEstablished && piScanIsComplete,
                     detailsAreComplete: native.detailsAreComplete && piScanIsComplete && piScope == nil),
                 native: native,
-                piScope: piScope)
+                piScope: piScope,
+                costProvenance: inclusiveCostProvenance)
         }
     }
 
@@ -1549,6 +1569,8 @@ public struct CostUsageFetcher: Sendable {
                 }
             }
 
+            let listPriceReportsPresent = reports.contains { !$0.data.isEmpty }
+            var openCodeLocalReport: CostUsageDailyReport?
             if openCodeLocalHistoryRequested {
                 // Provider-specific by design: this optional merge reads machine-local OpenCode
                 // history for OpenAI-provider assistant records into the cached ambient Codex
@@ -1557,6 +1579,7 @@ public struct CostUsageFetcher: Sendable {
                     .loadDailyReport(since: since, until: now, calendar: options.calendar)
                 {
                     reports.append(openCode)
+                    openCodeLocalReport = openCode
                 }
             }
 
@@ -1571,6 +1594,21 @@ public struct CostUsageFetcher: Sendable {
             // would let stale token rows inherit app-start freshness (#1964). lastRefreshAt
             // drives TTL suppression and stays native-only: a merged load must never delay a
             // rescan on the strength of another source's scan.
+            if let openCodeLocalReport {
+                // Provider-specific by design: OpenCode rows carry no Codex project or session
+                // attribution, so they join the unattributed bucket the Pi merge established.
+                if let project = Self.unknownProjectBreakdown(from: openCodeLocalReport) {
+                    projects.append(project)
+                    sessions = []
+                }
+            }
+            // Recorded OpenCode costs must not surface under a pure list-price claim;
+            // mirror the foreground scan's provenance so cache and live views agree.
+            let cachedCostProvenance: CostProvenance = if openCodeLocalReport != nil {
+                listPriceReportsPresent ? .mixed : .sourceRecorded
+            } else {
+                .listPriceEstimate
+            }
             return CachedCodexTokenSnapshotResult(
                 snapshot: Self.tokenSnapshot(
                     from: CostUsageDailyReport.merged(reports, calendar: options.calendar),
@@ -1578,7 +1616,7 @@ public struct CostUsageFetcher: Sendable {
                     historyDays: clampedHistoryDays,
                     calendar: options.calendar,
                     historyCoverageIsEstablished: displayedHistoryCoverageIsEstablished,
-                    costProvenance: .listPriceEstimate,
+                    costProvenance: cachedCostProvenance,
                     projects: Self.mergedProjectBreakdowns(projects),
                     sessions: sessions,
                     detailsAreComplete: nativeDetailsAreComplete && !piHistoryRequested,
