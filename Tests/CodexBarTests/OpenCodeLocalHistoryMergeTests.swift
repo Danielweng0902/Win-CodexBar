@@ -345,6 +345,29 @@ struct OpenCodeLocalHistoryMergeTests {
         let reencoded = try JSONDecoder().decode(
             CostUsageDailyReport.Entry.self, from: JSONEncoder().encode(entry))
         #expect(reencoded == entry)
+        // A recorded entry must survive its own encode/decode round trip.
+        let recorded = CostUsageDailyReport.Entry(
+            date: "2026-04-08",
+            inputTokens: 30,
+            outputTokens: 5,
+            totalTokens: 35,
+            requestCount: 1,
+            costUSD: 0,
+            modelsUsed: ["gpt-5.1-codex (OpenCode local)"],
+            modelBreakdowns: [
+                CostUsageDailyReport.ModelBreakdown(
+                    modelName: "gpt-5.1-codex (OpenCode local)",
+                    costUSD: 0,
+                    totalTokens: 35,
+                    requestCount: 1),
+            ],
+            costIsSourceRecorded: true)
+        let recordedData = try JSONEncoder().encode(recorded)
+        let recordedJSON = try #require(String(data: recordedData, encoding: .utf8))
+        #expect(recordedJSON.contains("\"costIsSourceRecorded\":true"))
+        let decodedRecorded = try JSONDecoder().decode(CostUsageDailyReport.Entry.self, from: recordedData)
+        #expect(decodedRecorded.costIsSourceRecorded == true)
+        #expect(decodedRecorded == recorded)
     }
 
     /// Writes one native Codex JSONL session with the given token count, so mixed-history

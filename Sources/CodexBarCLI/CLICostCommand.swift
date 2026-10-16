@@ -292,7 +292,7 @@ extension CodexBarCLI {
                 calendar: calendar,
                 useColor: useColor))
         }
-        lines.append(Self.costEstimateHint(provider: provider))
+        lines.append(Self.costEstimateHint(provider: provider, provenance: snapshot.costProvenance))
         return lines.compactMap(\.self).joined(separator: "\n")
     }
 

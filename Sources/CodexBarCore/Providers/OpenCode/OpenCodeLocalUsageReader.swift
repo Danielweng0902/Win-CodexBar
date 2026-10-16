@@ -131,12 +131,14 @@ public struct OpenCodeLocalUsageReader: Sendable {
         let flags = immutable ? SQLITE_OPEN_READONLY | SQLITE_OPEN_URI : SQLITE_OPEN_READONLY
         let openResult = sqlite3_open_v2(filename, &db, flags, nil)
         guard openResult == SQLITE_OK, db != nil else {
-            // sqlite3_open_v2 can return a non-null connection handle even on failure;
-            // close it before throwing so every refresh-failure path releases it.
+            // sqlite3_open_v2 can return a non-null connection handle even on failure.
+            // Capture the failure (it reads sqlite3_errcode/errmsg through the handle)
+            // before closing, then release the handle on every failure path.
+            let failure = Self.sqliteFailure(db: db, resultCode: openResult)
             if let db {
                 _ = sqlite3_close(db)
             }
-            throw Self.sqliteFailure(db: db, resultCode: openResult)
+            throw failure
         }
         defer { sqlite3_close(db) }
         sqlite3_busy_timeout(db, 250)

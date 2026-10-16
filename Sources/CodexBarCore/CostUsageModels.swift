@@ -716,6 +716,9 @@ public struct CostUsageDailyReport: Sendable, Codable {
             try container.encodeIfPresent(self.pricedRequestCount, forKey: .pricedRequestCount)
             try container.encodeIfPresent(self.unmeteredRequestCount, forKey: .unmeteredRequestCount)
             try container.encodeIfPresent(self.estimatedRequestCount, forKey: .estimatedRequestCount)
+            if self.costIsSourceRecorded {
+                try container.encode(true, forKey: .costIsSourceRecorded)
+            }
         }
 
         private static func decodeModelsUsed(from container: KeyedDecodingContainer<CodingKeys>) -> [String]? {
