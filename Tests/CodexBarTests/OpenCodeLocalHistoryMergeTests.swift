@@ -34,6 +34,9 @@ struct OpenCodeLocalHistoryMergeTests {
         #expect(merged.snapshot.last30DaysTokens == 35)
         // Recorded $0 cost (subscription usage) is preserved as-is, never reinterpreted.
         #expect(merged.snapshot.last30DaysCostUSD == 0)
+        // Rows keep a visible source label instead of silently merging into native totals.
+        let model = try #require(merged.snapshot.daily.first?.modelsUsed?.first)
+        #expect(model.hasSuffix("(OpenCode local)"))
     }
 
     @Test
@@ -78,6 +81,35 @@ struct OpenCodeLocalHistoryMergeTests {
             environment: ["OPENCODE_DB": databaseURL.path],
             now: day,
             codexHomePath: scopedHome.path,
+            historyDays: 1,
+            allowPricingRefresh: false,
+            includePiSessions: false,
+            includeOpenCodeLocalHistory: true,
+            scannerOptions: scannerOptions)
+
+        #expect((scoped.snapshot.last30DaysTokens ?? 0) == 0)
+    }
+
+    @Test
+    func `environment selected codex home never merges opencode local history`() async throws {
+        let env = try CostUsageTestEnvironment()
+        defer { env.cleanup() }
+        let day = try env.makeLocalNoon(year: 2026, month: 4, day: 8)
+        let databaseURL = try Self.makeOpenCodeDatabase(root: env.root, day: day)
+        let selectedHome = env.root.appendingPathComponent("selected-codex-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: selectedHome, withIntermediateDirectories: true)
+
+        let scannerOptions = CostUsageScanner.Options(
+            codexSessionsRoot: selectedHome.appendingPathComponent("sessions", isDirectory: true),
+            cacheRoot: env.cacheRoot,
+            codexTraceDatabaseURL: env.root.appendingPathComponent("missing-traces.sqlite"))
+        let scoped = try await CostUsageFetcher.loadTokenResult(
+            provider: .codex,
+            environment: [
+                "OPENCODE_DB": databaseURL.path,
+                "CODEX_HOME": selectedHome.path,
+            ],
+            now: day,
             historyDays: 1,
             allowPricingRefresh: false,
             includePiSessions: false,
@@ -185,6 +217,43 @@ struct OpenCodeLocalHistoryMergeTests {
             includeOpenCodeLocalHistory: true,
             scannerOptions: options,
             environment: ["OPENCODE_DB": databaseURL.path])
+        #expect((scoped?.snapshot.last30DaysTokens ?? 0) == 0)
+    }
+
+    @Test
+    func `cached publication honors environment selected codex homes`() async throws {
+        let env = try CostUsageTestEnvironment()
+        defer { env.cleanup() }
+        let day = try env.makeLocalNoon(year: 2026, month: 4, day: 8)
+        let databaseURL = try Self.makeOpenCodeDatabase(root: env.root, day: day)
+        let selectedHome = env.root.appendingPathComponent("selected-codex-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: selectedHome, withIntermediateDirectories: true)
+
+        let options = CostUsageScanner.Options(
+            codexSessionsRoot: selectedHome.appendingPathComponent("sessions", isDirectory: true),
+            cacheRoot: env.cacheRoot,
+            codexTraceDatabaseURL: env.root.appendingPathComponent("missing-traces.sqlite"))
+        var cache = CostUsageCache()
+        cache.lastScanUnixMs = Int64(day.timeIntervalSince1970 * 1000)
+        cache.scanSinceKey = "2026-04-07"
+        cache.scanUntilKey = "2026-04-09"
+        cache.timeZoneIdentifier = options.calendar.timeZone.identifier
+        cache.roots = CostUsageScanner.codexRootsFingerprint(options: options)
+        CostUsageStoreAccess.replace(
+            cacheRoot: env.cacheRoot,
+            cache: cache,
+            calendar: options.calendar)
+
+        let scoped = await CostUsageFetcher.loadCachedCodexTokenSnapshotResult(
+            now: day,
+            historyDays: 1,
+            includePiSessions: false,
+            includeOpenCodeLocalHistory: true,
+            scannerOptions: options,
+            environment: [
+                "OPENCODE_DB": databaseURL.path,
+                "CODEX_HOME": selectedHome.path,
+            ])
         #expect((scoped?.snapshot.last30DaysTokens ?? 0) == 0)
     }
 

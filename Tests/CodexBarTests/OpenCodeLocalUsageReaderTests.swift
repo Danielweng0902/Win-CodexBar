@@ -29,11 +29,11 @@ struct OpenCodeLocalUsageReaderTests {
         let loaded = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
             .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
         let result = try #require(loaded)
-        let entry = try #require(result.report.data.first)
-        #expect(result.report.data.count == 1)
+        let entry = try #require(result.data.first)
+        #expect(result.data.count == 1)
         #expect(entry.costUSD == 1.5)
         #expect(entry.requestCount == 1)
-        #expect(entry.modelsUsed == ["gpt-5.1-codex"])
+        #expect(entry.modelsUsed == ["gpt-5.1-codex (OpenCode local)"])
     }
 
     @Test
@@ -55,7 +55,7 @@ struct OpenCodeLocalUsageReaderTests {
         let loaded = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
             .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
         let result = try #require(loaded)
-        let entry = try #require(result.report.data.first)
+        let entry = try #require(result.data.first)
         #expect(entry.costUSD == 5)
         #expect(entry.requestCount == 2)
         #expect(entry.inputTokens == 10)
@@ -90,10 +90,10 @@ struct OpenCodeLocalUsageReaderTests {
         let loaded = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
             .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
         let result = try #require(loaded)
-        let entry = try #require(result.report.data.first)
+        let entry = try #require(result.data.first)
         #expect(entry.costUSD == 5)
         #expect(entry.requestCount == 2)
-        #expect(entry.modelsUsed?.sorted() == ["gpt-5.1-codex", "gpt-5.2"])
+        #expect(entry.modelsUsed?.sorted() == ["gpt-5.1-codex (OpenCode local)", "gpt-5.2 (OpenCode local)"])
     }
 
     @Test
@@ -109,7 +109,7 @@ struct OpenCodeLocalUsageReaderTests {
         let loaded = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
             .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
         let result = try #require(loaded)
-        let entry = try #require(result.report.data.first)
+        let entry = try #require(result.data.first)
         #expect(entry.costUSD == 1)
         #expect(entry.requestCount == 1)
         #expect(entry.totalTokens == 3)
@@ -129,7 +129,7 @@ struct OpenCodeLocalUsageReaderTests {
         let loaded = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
             .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
         let result = try #require(loaded)
-        let entry = try #require(result.report.data.first)
+        let entry = try #require(result.data.first)
         #expect(entry.costUSD == 0)
         #expect(entry.totalTokens == 150)
     }
@@ -152,7 +152,7 @@ struct OpenCodeLocalUsageReaderTests {
 
         let result = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
             .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
-        let entry = try #require(result?.report.data.first)
+        let entry = try #require(result?.data.first)
         #expect(entry.requestCount == 1)
         #expect(entry.costUSD == 1)
     }
@@ -174,10 +174,10 @@ struct OpenCodeLocalUsageReaderTests {
 
         let result = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
             .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
-        let entry = try #require(result?.report.data.first)
+        let entry = try #require(result?.data.first)
         #expect(entry.requestCount == 2)
         #expect(entry.totalTokens == nil)
-        #expect(entry.modelsUsed?.sorted() == ["negative", "overflow"])
+        #expect(entry.modelsUsed?.sorted() == ["negative (OpenCode local)", "overflow (OpenCode local)"])
     }
 
     @Test
@@ -196,7 +196,7 @@ struct OpenCodeLocalUsageReaderTests {
 
         let result = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
             .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
-        let entry = try #require(result?.report.data.first)
+        let entry = try #require(result?.data.first)
         #expect(entry.requestCount == 1)
         #expect(entry.costUSD == 1)
     }
@@ -232,7 +232,7 @@ struct OpenCodeLocalUsageReaderTests {
         let loaded = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
             .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
         let result = try #require(loaded)
-        let entry = try #require(result.report.data.first)
+        let entry = try #require(result.data.first)
         #expect(entry.costUSD == 4)
     }
 
@@ -253,7 +253,7 @@ struct OpenCodeLocalUsageReaderTests {
         let loaded = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
             .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
         let result = try #require(loaded)
-        let entry = try #require(result.report.data.first)
+        let entry = try #require(result.data.first)
         #expect(entry.costUSD == 6)
         #expect(entry.requestCount == 1)
     }
@@ -274,7 +274,7 @@ struct OpenCodeLocalUsageReaderTests {
         let loaded = try reader.loadDailyReport(
             since: now.addingTimeInterval(-3600), until: now, calendar: .current)
         let result = try #require(loaded)
-        #expect(result.scope.databaseFilename == "opencode.db")
+        #expect(result.data.first?.requestCount == 1)
     }
 
     @Test
@@ -302,30 +302,74 @@ struct OpenCodeLocalUsageReaderTests {
     }
 
     @Test
-    func `scope fingerprint is stable for identical rows`() throws {
+    func `earlier today rows survive a clock time lower bound`() throws {
         let env = try Self.makeEnvironment()
         defer { try? FileManager.default.removeItem(at: env.root) }
         try Self.createDatabase(at: env.databaseURL)
+        // 2026-10-16 15:00 local; the row landed at 10:00 the same day.
+        let now = Date(timeIntervalSince1970: 1_772_798_400)
+        let morning = now.addingTimeInterval(-5 * 3600)
+        try Self.insertMessage(
+            databaseURL: env.databaseURL, createdMs: Self.ms(morning), cost: 1,
+            model: "gpt-5.1-codex", providerID: "openai")
+
+        // A `now`-anchored one-hour window must still include the morning row once the
+        // lower bound is normalized to the reporting day's start.
+        let loaded = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
+            .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+        let result = try #require(loaded)
+        #expect(result.data.first?.requestCount == 1)
+    }
+
+    @Test
+    func `day keys follow the supplied reporting calendar`() throws {
+        let env = try Self.makeEnvironment()
+        defer { try? FileManager.default.removeItem(at: env.root) }
+        try Self.createDatabase(at: env.databaseURL)
+        var utcCalendar = Calendar(identifier: .gregorian)
+        utcCalendar.timeZone = TimeZone(identifier: "UTC") ?? .current
+        // 2026-10-16 00:30 UTC: a local-time calendar would file this under October 15.
+        let boundary = try #require(utcCalendar.date(
+            from: DateComponents(year: 2026, month: 10, day: 16, hour: 0, minute: 30)))
+        try Self.insertMessage(
+            databaseURL: env.databaseURL, createdMs: Self.ms(boundary), cost: 1,
+            model: "gpt-5.1-codex", providerID: "openai")
+
+        let loaded = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
+            .loadDailyReport(since: boundary.addingTimeInterval(-3600), until: boundary.addingTimeInterval(3600), calendar: utcCalendar)
+        let result = try #require(loaded)
+        #expect(result.data.first?.date == "2026-10-16")
+    }
+
+    @Test
+    func `xdg data home relocates the database discovery`() throws {
+        let env = try Self.makeEnvironment()
+        defer { try? FileManager.default.removeItem(at: env.root) }
+        let xdgRoot = env.root.appendingPathComponent("xdg-data", isDirectory: true)
+        let xdgDirectory = xdgRoot.appendingPathComponent("opencode", isDirectory: true)
+        try FileManager.default.createDirectory(at: xdgDirectory, withIntermediateDirectories: true)
+        let databaseURL = xdgDirectory.appendingPathComponent("opencode.db", isDirectory: false)
+        try Self.createDatabase(at: databaseURL)
         let now = Date(timeIntervalSince1970: 1_772_798_400)
         try Self.insertMessage(
-            databaseURL: env.databaseURL, createdMs: Self.ms(now), cost: 1,
+            databaseURL: databaseURL, createdMs: Self.ms(now), cost: 1,
             model: "gpt-5.1-codex", providerID: "openai")
 
-        let firstLoaded = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
-            .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
-        let first = try #require(firstLoaded)
-        let secondLoaded = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
-            .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
-        let second = try #require(secondLoaded)
-        #expect(first.scope == second.scope)
+        let reader = OpenCodeLocalUsageReader(
+            homeDirectory: env.root,
+            environment: ["XDG_DATA_HOME": xdgRoot.path])
+        let loaded = try reader.loadDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+        let result = try #require(loaded)
+        #expect(result.data.first?.requestCount == 1)
 
-        try Self.insertMessage(
-            databaseURL: env.databaseURL, createdMs: Self.ms(now), cost: 1,
-            model: "gpt-5.1-codex", providerID: "openai")
-        let thirdLoaded = try OpenCodeLocalUsageReader(databaseURLs: [env.databaseURL])
-            .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
-        let third = try #require(thirdLoaded)
-        #expect(first.scope != third.scope)
+        // A relative XDG_DATA_HOME is ignored per the XDG spec; discovery falls back to
+        // ~/.local/share/opencode, which holds no database in this environment.
+        let relativeReader = OpenCodeLocalUsageReader(
+            homeDirectory: env.root,
+            environment: ["XDG_DATA_HOME": "relative/path"])
+        #expect(try relativeReader.loadDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current) == nil)
     }
 }
 

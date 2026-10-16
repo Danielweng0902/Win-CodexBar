@@ -30,15 +30,26 @@ public struct OpenCodeLocalUsageReader: Sendable {
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         environment: [String: String] = ProcessInfo.processInfo.environment)
     {
-        let dataDirectory = homeDirectory
-            .appendingPathComponent(".local", isDirectory: true)
-            .appendingPathComponent("share", isDirectory: true)
-            .appendingPathComponent("opencode", isDirectory: true)
-        self.databaseURLs = Self.candidateDatabaseURLs(dataDirectory: dataDirectory, environment: environment)
+        let dataRoot = Self.xdgDataRoot(homeDirectory: homeDirectory, environment: environment)
+        let openCodeDirectory = dataRoot.appendingPathComponent("opencode", isDirectory: true)
+        self.databaseURLs = Self.candidateDatabaseURLs(dataDirectory: openCodeDirectory, environment: environment)
     }
 
     public init(databaseURLs: [URL]) {
         self.databaseURLs = databaseURLs
+    }
+
+    /// Resolves the XDG data root the way OpenCode's `xdg-basedir` dependency does: an
+    /// absolute `XDG_DATA_HOME` wins; relative or missing values fall back to `~/.local/share`.
+    static func xdgDataRoot(homeDirectory: URL, environment: [String: String]) -> URL {
+        if let raw = Self.cleaned(environment["XDG_DATA_HOME"]),
+           raw.hasPrefix("/")
+        {
+            return URL(fileURLWithPath: raw, isDirectory: true)
+        }
+        return homeDirectory
+            .appendingPathComponent(".local", isDirectory: true)
+            .appendingPathComponent("share", isDirectory: true)
     }
 
     /// Resolves the database OpenCode itself would use, mirroring upstream `database.path()`:
@@ -76,31 +87,10 @@ public struct OpenCodeLocalUsageReader: Sendable {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    /// A short scope fingerprint identifying which database contributed rows, so callers can
-    /// key caches and diagnostics without exposing home-directory paths.
-    public struct Scope: Hashable, Sendable {
-        public let databaseFilename: String
-        public let rowFingerprint: String
-
-        public var signature: String {
-            "opencode-local:\(self.databaseFilename):\(self.rowFingerprint)"
-        }
-    }
-
-    public struct Result: Sendable {
-        public let report: CostUsageDailyReport
-        public let scope: Scope
-
-        init(report: CostUsageDailyReport, scope: Scope) {
-            self.report = report
-            self.scope = scope
-        }
-    }
-
-    /// Returns `nil` when no candidate database exists or it holds no matching rows. Only
-    /// genuine SQLite read failures throw, so a missing or empty OpenCode installation never
-    /// disrupts the native Codex scan.
-    public func loadDailyReport(since: Date, until: Date, calendar: Calendar) throws -> Result? {
+    /// A daily report built from the matched rows. The report is `nil` when no candidate
+    /// database exists or it holds no matching rows; only genuine SQLite read failures throw,
+    /// so a missing or empty OpenCode installation never disrupts the native Codex scan.
+    public func loadDailyReport(since: Date, until: Date, calendar: Calendar) throws -> CostUsageDailyReport? {
         for url in self.databaseURLs {
             guard FileManager.default.fileExists(atPath: url.path) else { continue }
             guard let rows = try self.readRows(databaseURL: url), !rows.isEmpty else { continue }
@@ -108,14 +98,9 @@ public struct OpenCodeLocalUsageReader: Sendable {
             guard !entries.isEmpty else { continue }
             // Merge same-day entries into one entry per day, matching how native Codex
             // history is keyed, so downstream aggregation sees a single day row.
-            let report = CostUsageDailyReport.merged(
+            return CostUsageDailyReport.merged(
                 [CostUsageDailyReport(data: entries, summary: nil)],
                 calendar: calendar)
-            return Result(
-                report: report,
-                scope: Scope(
-                    databaseFilename: url.lastPathComponent,
-                    rowFingerprint: Self.rowFingerprint(rows: rows)))
         }
         return nil
     }
@@ -356,33 +341,28 @@ public struct OpenCodeLocalUsageReader: Sendable {
         }
     }
 
-    private static func rowFingerprint(rows: [UsageRow]) -> String {
-        var hasher = Hasher()
-        for row in rows {
-            hasher.combine(row.createdMs)
-            hasher.combine(row.cost.bitPattern)
-            hasher.combine(row.model)
-            hasher.combine(row.tokens?.resolvedTotal)
-        }
-        return String(format: "%08x", UInt32(truncatingIfNeeded: hasher.finalize()))
-    }
-
-    /// Buckets rows into calendar-day entries (device local time, matching how Codex cost
-    /// history is keyed) so they merge with native Codex history the same way Pi rows do.
+    /// Buckets rows into calendar-day entries keyed by the supplied reporting calendar,
+    /// matching how native Codex history is keyed, so they merge consistently with it.
     private static func dailyEntries(
         rows: [UsageRow],
         since: Date,
         until: Date,
         calendar: Calendar) -> [CostUsageDailyReport.Entry]
     {
-        let sinceMs = Int64(since.timeIntervalSince1970 * 1000)
+        // Normalize the lower bound to the reporting day's start: the foreground scan passes
+        // a `now`-anchored window, and a clock-time bound would drop earlier-today turns.
+        let sinceStartMs = Int64(calendar.startOfDay(for: since).timeIntervalSince1970 * 1000)
         let untilMs = Int64(until.timeIntervalSince1970 * 1000)
         return rows.compactMap { row in
-            guard row.createdMs >= sinceMs, row.createdMs <= untilMs else { return nil }
+            guard row.createdMs >= sinceStartMs, row.createdMs <= untilMs else { return nil }
             let date = Date(timeIntervalSince1970: TimeInterval(row.createdMs) / 1000)
-            let key = CostUsageScanner.CostUsageDayRange.dayKey(from: date)
+            let key = CostUsageScanner.CostUsageDayRange.dayKey(from: date, calendar: calendar)
             let trimmedModel = row.model.trimmingCharacters(in: .whitespacesAndNewlines)
-            let model = trimmedModel.isEmpty ? "unknown" : trimmedModel
+            let baseModel = trimmedModel.isEmpty ? "unknown" : trimmedModel
+            // Keep the source visible (#3273 contract): rows stay identifiable as OpenCode
+            // local history in UI model breakdowns and CLI JSON instead of silently merging
+            // into native model totals.
+            let model = "\(baseModel) (OpenCode local)"
             let tokens = row.tokens
             let breakdown = CostUsageDailyReport.ModelBreakdown(
                 modelName: model,
@@ -420,7 +400,7 @@ public struct OpenCodeLocalUsageReader: Sendable {
 
     public init(databaseURLs _: [URL]) {}
 
-    public func loadDailyReport(since _: Date, until _: Date, calendar _: Calendar) throws -> Result? {
+    public func loadDailyReport(since _: Date, until _: Date, calendar _: Calendar) throws -> CostUsageDailyReport? {
         nil
     }
 }

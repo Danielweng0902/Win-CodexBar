@@ -712,7 +712,7 @@ public struct CostUsageFetcher: Sendable {
         // Provider-specific by design: machine-local OpenCode history only joins the ambient
         // Codex ledger; scoped homes and non-Codex providers never merge it (#3273 contract).
         let shouldMergeOpenCodeLocalUsage = includeOpenCodeLocalHistory &&
-            provider == .codex && scopedCodexHomePath?.isEmpty != false
+            provider == .codex && Self.codexHistoryIsAmbient(codexHomePath: codexHomePath, environment: environment)
         await Self.refreshPricingIfAllowed(
             options: PricingRefreshOptions(
                 provider: provider,
@@ -844,7 +844,17 @@ public struct CostUsageFetcher: Sendable {
         let inclusive: LocalTokenScanReport
         let native: LocalTokenScanReport
         let piScope: String?
-        let openCodeLocalScope: String?
+    }
+
+    /// Provider-specific by design: machine-local OpenCode history joins only scans whose
+    /// Codex home was not explicitly selected, whether through the `codexHomePath` argument
+    /// or the process `CODEX_HOME` the native scanner honors. Managed profiles, scoped CLI
+    /// homes, and other providers never see machine-wide OpenCode rows (#3273 contract).
+    static func codexHistoryIsAmbient(codexHomePath: String?, environment: [String: String]) -> Bool {
+        if let path = codexHomePath?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
+            return false
+        }
+        return environment["CODEX_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
     }
 
     private struct LocalTokenScanOptions: Sendable {
@@ -984,7 +994,6 @@ public struct CostUsageFetcher: Sendable {
                     [daily, piScanResult.report],
                     calendar: options.scanOptions.calendar)
             }
-            var openCodeLocalScope: String?
             if options.shouldMergeOpenCodeLocalUsage {
                 // Provider-specific by design: this optional merge reads machine-local OpenCode
                 // history for OpenAI-provider assistant records into the ambient Codex ledger.
@@ -994,9 +1003,8 @@ public struct CostUsageFetcher: Sendable {
                     .loadDailyReport(since: since, until: now, calendar: options.scanOptions.calendar)
                 {
                     daily = CostUsageDailyReport.merged(
-                        [daily, openCode.report],
+                        [daily, openCode],
                         calendar: options.scanOptions.calendar)
-                    openCodeLocalScope = openCode.scope.signature
                 }
             }
             if provider == .codex {
@@ -1011,8 +1019,7 @@ public struct CostUsageFetcher: Sendable {
                     historyCoverageIsEstablished: native.historyCoverageIsEstablished && piScanIsComplete,
                     detailsAreComplete: native.detailsAreComplete && piScanIsComplete && piScope == nil),
                 native: native,
-                piScope: piScope,
-                openCodeLocalScope: openCodeLocalScope)
+                piScope: piScope)
         }
     }
 
@@ -1395,8 +1402,10 @@ public struct CostUsageFetcher: Sendable {
         guard scopedCodexHomePath?.isEmpty != false || allowScopedCodexHome else { return nil }
         let piHistoryRequested = includePiSessions && scopedCodexHomePath?.isEmpty != false
         // Provider-specific by design: machine-local OpenCode history only joins the ambient
-        // Codex cache publication; explicitly scoped homes never request it.
-        let openCodeLocalHistoryRequested = includeOpenCodeLocalHistory && scopedCodexHomePath?.isEmpty != false
+        // Codex cache publication; explicitly scoped homes (argument or CODEX_HOME) never
+        // request it.
+        let openCodeLocalHistoryRequested = includeOpenCodeLocalHistory &&
+            Self.codexHistoryIsAmbient(codexHomePath: codexHomePath, environment: environment)
         let processContexts: [PiSessionProcessContext] = if piHistoryRequested, piScannerOptions == nil {
             await LocalAgentSessionScanner().piSessionProcessContexts(environment: environment)
         } else {
@@ -1547,7 +1556,7 @@ public struct CostUsageFetcher: Sendable {
                 if let openCode = try? OpenCodeLocalUsageReader(environment: environment)
                     .loadDailyReport(since: since, until: now, calendar: options.calendar)
                 {
-                    reports.append(openCode.report)
+                    reports.append(openCode)
                 }
             }
 
