@@ -1454,7 +1454,7 @@ extension UsageStore {
             return
         }
 
-        guard self.settings.isCostUsageEffectivelyEnabled(for: provider), self.isEnabled(provider) else {
+        guard self.settings.isHistoryLaneEffectivelyEnabled(for: provider), self.isEnabled(provider) else {
             self.resetTokenUsageState(for: provider)
             return
         }

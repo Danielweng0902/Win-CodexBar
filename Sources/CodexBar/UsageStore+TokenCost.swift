@@ -387,7 +387,7 @@ extension UsageStore {
     @discardableResult
     func hydrateCachedTokenSnapshots(now: Date = Date()) -> Task<Void, Never>? {
         // Provider-specific by design: only the Codex local ledger hydrates a cached snapshot before the first scan.
-        guard self.settings.isCostUsageEffectivelyEnabled(for: .codex) else { return nil }
+        guard self.settings.isHistoryLaneEffectivelyEnabled(for: .codex) else { return nil }
         guard self.settings.enabledProvidersOrdered(metadataByProvider: self.providerMetadata).contains(.codex) else {
             return nil
         }
@@ -443,7 +443,7 @@ extension UsageStore {
                   self.tokenAccountingScopeIsCurrent(result.accounting, for: .codex),
                   self.settings.providerConfigRevision(for: .codex) == providerConfigRevision,
                   self.settings.costUsageSettingsRevision == costUsageSettingsRevision,
-                  self.settings.isCostUsageEffectivelyEnabled(for: .codex),
+                  self.settings.isHistoryLaneEffectivelyEnabled(for: .codex),
                   self.isEnabled(.codex),
                   self.tokenCostScope(for: .codex).signature == scope.signature,
                   self.settings.costUsageHistoryDays == historyDays,
@@ -666,7 +666,7 @@ extension UsageStore {
         guard self.providerPublicationRevisionIsCurrent(scope.publicationRevision, for: provider),
               self.settings.providerConfigRevision(for: provider) == scope.providerConfigRevision,
               self.settings.costUsageSettingsRevision == scope.costSettingsRevision,
-              self.settings.isCostUsageEffectivelyEnabled(for: provider),
+              self.settings.isHistoryLaneEffectivelyEnabled(for: provider),
               self.isEnabled(provider),
               self.settings.costUsageHistoryDays == scope.historyDays
         else {
