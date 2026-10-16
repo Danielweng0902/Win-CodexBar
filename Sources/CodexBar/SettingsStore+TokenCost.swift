@@ -11,7 +11,7 @@ extension SettingsStore {
     }
 
     func costSummaryShowsSubmenu(for provider: UsageProvider) -> Bool {
-        self.isCostUsageEffectivelyEnabled(for: provider) &&
+        self.isHistoryLaneEffectivelyEnabled(for: provider) &&
             self.costSummaryDisplayStyle.showsCostSubmenu
     }
 

@@ -49,6 +49,27 @@ struct OpenCodeLocalHistorySettingsTests {
         #expect(fixture.settings.isHistoryLaneEffectivelyEnabled(for: .codex))
     }
 
+    @Test
+    func `menu card exposes the codex cost section from the opencode opt-in alone`() throws {
+        let fixture = try self.makeSettingsFixture(suite: "OpenCodeLocalHistorySettingsTests-menu")
+        // Default-off with no other cost source: the ambient history lane stays hidden.
+        #expect(!fixture.settings.costUsageEnabled)
+        #expect(!fixture.settings.codexLocalSessionCostLedgerEnabled)
+        #expect(!fixture.store.menuCardInput(for: .codex, context: .menu).tokenCostUsageEnabled)
+        #expect(!fixture.store.menuCardInput(for: .codex, context: .menu).tokenCostMenuSectionEnabled)
+
+        // The opt-in alone surfaces the menu-history lane for a user whose only source is
+        // OpenCode — no second cost toggle required.
+        fixture.settings.codexIncludeOpenCodeLocalHistory = true
+        #expect(fixture.store.menuCardInput(for: .codex, context: .menu).tokenCostUsageEnabled)
+        #expect(fixture.store.menuCardInput(for: .codex, context: .menu).tokenCostMenuSectionEnabled)
+        #expect(fixture.store.menuCardInput(for: .codex, context: .settings).tokenCostMenuSectionEnabled)
+
+        // Other providers never activate through this opt-in.
+        #expect(!fixture.store.menuCardInput(for: .claude, context: .menu).tokenCostUsageEnabled)
+        #expect(!fixture.store.menuCardInput(for: .claude, context: .menu).tokenCostMenuSectionEnabled)
+    }
+
     private func makeSettingsFixture(suite: String) throws -> Fixture {
         let settings = testSettingsStore(suiteName: suite)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
