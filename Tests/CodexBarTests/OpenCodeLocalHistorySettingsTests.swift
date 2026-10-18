@@ -70,6 +70,24 @@ struct OpenCodeLocalHistorySettingsTests {
         #expect(!fixture.store.menuCardInput(for: .claude, context: .menu).tokenCostMenuSectionEnabled)
     }
 
+    @Test
+    func `inline summary style renders from the opencode opt-in alone`() throws {
+        let fixture = try self.makeSettingsFixture(suite: "OpenCodeLocalHistorySettingsTests-inline")
+        fixture.settings.costSummaryDisplayStyle = .inlineSummary
+        // Default-off with no other cost source: the inline lane stays hidden.
+        #expect(!fixture.settings.costSummaryShowsInline(for: .codex))
+
+        // The opt-in alone renders the inline summary — the only presentation under this
+        // style, since .inlineSummary disables the submenu.
+        fixture.settings.codexIncludeOpenCodeLocalHistory = true
+        #expect(fixture.settings.costSummaryShowsInline(for: .codex))
+        #expect(!fixture.settings.costSummaryShowsSubmenu(for: .codex))
+        #expect(fixture.store.menuCardInput(for: .codex, context: .menu).costSummaryInlineEnabled)
+
+        // Other providers never activate through this opt-in.
+        #expect(!fixture.settings.costSummaryShowsInline(for: .claude))
+    }
+
     private func makeSettingsFixture(suite: String) throws -> Fixture {
         let settings = testSettingsStore(suiteName: suite)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

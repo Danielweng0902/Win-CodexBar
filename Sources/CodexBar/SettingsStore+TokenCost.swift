@@ -3,9 +3,11 @@ import Foundation
 
 extension SettingsStore {
     func costSummaryShowsInline(for provider: UsageProvider) -> Bool {
-        // Provider-specific by design: Codex's local ledger can enable its summary without the global scanner.
+        // Provider-specific by design: Codex's local ledger and OpenCode local history can
+        // enable its summary without the global scanner.
         let isEnabled = self.costUsageEnabled ||
-            (provider == .codex && self.codexLocalSessionCostLedgerEnabled)
+            (provider == .codex &&
+                (self.codexLocalSessionCostLedgerEnabled || self.codexIncludeOpenCodeLocalHistory))
         return isEnabled &&
             self.costSummaryDisplayStyle.showsInlineSummary
     }

@@ -997,7 +997,9 @@ public struct CostUsageFetcher: Sendable {
                     calendar: options.scanOptions.calendar)
             }
             var openCodeLocalReport: CostUsageDailyReport?
-            let listPriceHistoryPresent = !daily.data.isEmpty
+            // Mixed provenance claims a list-price estimate is included, so it must rest on an
+            // actual native cost — unpriced native rows (unknown model) contribute tokens only.
+            let listPriceHistoryPresent = daily.data.contains { $0.costUSD != nil }
             if options.shouldMergeOpenCodeLocalUsage {
                 // Provider-specific by design: this optional merge reads machine-local OpenCode
                 // history for OpenAI-provider assistant records into the ambient Codex ledger.
@@ -1569,7 +1571,11 @@ public struct CostUsageFetcher: Sendable {
                 }
             }
 
-            let listPriceReportsPresent = reports.contains { !$0.data.isEmpty }
+            // Mirror the foreground scan: only a native row with an actual cost carries the
+            // list-price half of a mixed provenance claim.
+            let listPriceReportsPresent = reports.contains { report in
+                report.data.contains { $0.costUSD != nil }
+            }
             var openCodeLocalReport: CostUsageDailyReport?
             if openCodeLocalHistoryRequested {
                 // Provider-specific by design: this optional merge reads machine-local OpenCode

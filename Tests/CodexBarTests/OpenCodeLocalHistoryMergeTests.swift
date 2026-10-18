@@ -94,6 +94,47 @@ struct OpenCodeLocalHistoryMergeTests {
     }
 
     @Test
+    func `unpriced native history keeps provenance source recorded`() async throws {
+        let env = try CostUsageTestEnvironment()
+        defer { env.cleanup() }
+        let day = try env.makeLocalNoon(year: 2026, month: 4, day: 8)
+        let databaseURL = try Self.makeOpenCodeDatabase(root: env.root, day: day)
+        // A native model with no list price contributes tokens only; its rows carry no cost,
+        // so a mixed provenance would claim an estimate that is not actually included.
+        try Self.writeNativeCodexSession(
+            env: env,
+            day: day,
+            filename: "unpriced-native.jsonl",
+            tokens: 100,
+            model: "unknown-unpriced-model")
+
+        var scannerOptions = CostUsageScanner.Options(
+            codexSessionsRoot: env.codexSessionsRoot,
+            cacheRoot: env.cacheRoot,
+            codexTraceDatabaseURL: env.root.appendingPathComponent("missing-traces.sqlite"))
+        scannerOptions.refreshMinIntervalSeconds = 0
+        let merged = try await CostUsageFetcher.loadTokenResult(
+            provider: .codex,
+            environment: [
+                "OPENCODE_DB": databaseURL.path,
+                "HOME": env.root.path,
+            ],
+            now: day,
+            historyDays: 1,
+            allowPricingRefresh: false,
+            includePiSessions: false,
+            includeOpenCodeLocalHistory: true,
+            scannerOptions: scannerOptions)
+
+        // Tokens still merge from both sources.
+        #expect(merged.snapshot.last30DaysTokens == 135)
+        // But the cost claim stays recorded-only: no native list-price amount exists.
+        #expect(merged.snapshot.costProvenance == .sourceRecorded)
+        let window = merged.snapshot.summary(forLastDays: 1, calendar: scannerOptions.calendar)
+        #expect(window.provenance == .sourceRecorded)
+    }
+
+    @Test
     func `ambient codex scan stays native when the source is off`() async throws {
         let env = try CostUsageTestEnvironment()
         defer { env.cleanup() }
@@ -376,7 +417,8 @@ struct OpenCodeLocalHistoryMergeTests {
         env: CostUsageTestEnvironment,
         day: Date,
         filename: String,
-        tokens: Int) throws
+        tokens: Int,
+        model: String = "gpt-5.4") throws
     {
         var partition = Calendar(identifier: .gregorian)
         partition.timeZone = TimeZone(identifier: "UTC") ?? .current
@@ -386,7 +428,6 @@ struct OpenCodeLocalHistoryMergeTests {
             .appendingPathComponent(String(format: "%02d", components.month ?? 1), isDirectory: true)
             .appendingPathComponent(String(format: "%02d", components.day ?? 1), isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let model = "gpt-5.4"
         try env.jsonl([
             [
                 "type": "session_meta",
