@@ -110,6 +110,43 @@ struct OpenCodeLocalHistorySettingsTests {
         #expect(fixture.store.shouldIncludeOpenCodeLocalHistoryInTokenSnapshot(for: .codex))
     }
 
+    @Test
+    func `ambient opencode publication survives codex account switches`() throws {
+        let fixture = try self.makeSettingsFixture(suite: "OpenCodeLocalHistorySettingsTests-account")
+        let store = fixture.store
+
+        // The opt-in selects the ambient scope; a publication under that scope installs.
+        store.settings.codexIncludeOpenCodeLocalHistory = true
+        store.installCachedTokenSnapshot(Self.snapshot(cost: 1), for: .codex)
+        #expect(store.accountScopedTokenSnapshot(for: .codex) != nil)
+
+        // An account switch bumps the provider-config revision, but ambient history is
+        // account-agnostic: the still-current ambient publication must not be discarded
+        // or the This Mac section would vanish behind a rescan.
+        let revisionBefore = store.settings.providerConfigRevision(for: .codex)
+        store.settings.codexActiveSource = .managedAccount(id: UUID())
+        #expect(store.settings.providerConfigRevision(for: .codex) != revisionBefore)
+        #expect(store.accountScopedTokenSnapshot(for: .codex) != nil)
+
+        // A pre-toggle scoped publication must not leak account rows into the ambient lane.
+        store.settings.codexIncludeOpenCodeLocalHistory = false
+        store.settings._test_activeManagedCodexRemoteHomePath = "/tmp/managed-codex-home"
+        store.settings.codexActiveSource = .managedAccount(id: UUID())
+        store.installCachedTokenSnapshot(Self.snapshot(cost: 2), for: .codex)
+        store.settings.codexIncludeOpenCodeLocalHistory = true
+        #expect(store.accountScopedTokenSnapshot(for: .codex) == nil)
+    }
+
+    private static func snapshot(cost: Double) -> CostUsageTokenSnapshot {
+        CostUsageTokenSnapshot(
+            sessionTokens: 10,
+            sessionCostUSD: cost,
+            last30DaysTokens: 10,
+            last30DaysCostUSD: cost,
+            daily: [],
+            updatedAt: Date())
+    }
+
     private func makeSettingsFixture(suite: String) throws -> Fixture {
         let settings = testSettingsStore(suiteName: suite)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

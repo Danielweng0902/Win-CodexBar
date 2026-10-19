@@ -450,7 +450,8 @@ extension StatusItemController {
             projects: provider == .codex ? tokenSnapshot.projects : [],
             sessions: provider == .codex ? tokenSnapshot.sessions : [],
             hidePersonalInfo: self.settings.hidePersonalInfo,
-            width: width)
+            width: width,
+            costProvenance: tokenSnapshot.costProvenance)
         let hosting = MenuHostingView(rootView: chartView.codexBarLocalized())
         let scrollView = CostHistoryMenuScrollView(
             hosting: hosting,
