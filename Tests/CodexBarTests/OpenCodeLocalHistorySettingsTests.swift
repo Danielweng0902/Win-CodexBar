@@ -88,6 +88,28 @@ struct OpenCodeLocalHistorySettingsTests {
         #expect(!fixture.settings.costSummaryShowsInline(for: .claude))
     }
 
+    @Test
+    func `opencode opt-in selects the ambient scope over the managed account home`() throws {
+        let fixture = try self.makeSettingsFixture(suite: "OpenCodeLocalHistorySettingsTests-scope")
+        fixture.settings._test_activeManagedCodexRemoteHomePath = "/tmp/managed-codex-home"
+        fixture.settings.codexActiveSource = .managedAccount(id: UUID())
+        defer { fixture.settings._test_activeManagedCodexRemoteHomePath = nil }
+
+        // Default-off: the managed home stays selected and the merge stays gated off.
+        let managedScope = fixture.store.tokenCostScope(for: .codex)
+        #expect(managedScope.codexHomePath == "/tmp/managed-codex-home")
+        #expect(!fixture.store.shouldIncludeOpenCodeLocalHistoryInTokenSnapshot(for: .codex))
+
+        // The opt-in selects the ambient home — the machine-local scope its rows live in —
+        // mirroring the local ledger, so the merge gate opens instead of scanning a home
+        // whose scoped rows can never include OpenCode history.
+        fixture.settings.codexIncludeOpenCodeLocalHistory = true
+        let ambientScope = fixture.store.tokenCostScope(for: .codex)
+        #expect(ambientScope.codexHomePath == nil)
+        #expect(ambientScope.signature == "codex:ambient")
+        #expect(fixture.store.shouldIncludeOpenCodeLocalHistoryInTokenSnapshot(for: .codex))
+    }
+
     private func makeSettingsFixture(suite: String) throws -> Fixture {
         let settings = testSettingsStore(suiteName: suite)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

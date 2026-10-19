@@ -493,7 +493,11 @@ extension UsageStore {
         guard provider == .codex else {
             return (nil, provider.rawValue)
         }
-        if self.settings.codexLocalSessionCostLedgerEnabled {
+        // The local ledger and the OpenCode local history opt-in both describe machine-local
+        // ambient history, so either selects the ambient home like the ledger always has;
+        // without this the opt-in would scan a managed home whose scoped rows can never
+        // include OpenCode history, leaving the toggle ineffective (#3273 contract).
+        if self.settings.codexLocalSessionCostLedgerEnabled || self.settings.codexIncludeOpenCodeLocalHistory {
             return (nil, "codex:ambient")
         }
         let activeSource = self.settings.codexActiveSource

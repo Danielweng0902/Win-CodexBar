@@ -94,6 +94,50 @@ struct OpenCodeLocalHistoryMergeTests {
     }
 
     @Test
+    func `narrow window of a mixed snapshot stays source recorded`() async throws {
+        let env = try CostUsageTestEnvironment()
+        defer { env.cleanup() }
+        let day = try env.makeLocalNoon(year: 2026, month: 4, day: 8)
+        let olderDay = try env.makeLocalNoon(year: 2026, month: 4, day: 5)
+        // OpenCode recorded cost lands on the recent day; the priced native session is
+        // two days older, so the snapshot is mixed but today's window is recorded-only.
+        let databaseURL = try Self.makeOpenCodeDatabase(root: env.root, day: day)
+        try Self.writeNativeCodexSession(
+            env: env,
+            day: olderDay,
+            filename: "older-priced-native.jsonl",
+            tokens: 100)
+
+        var scannerOptions = CostUsageScanner.Options(
+            codexSessionsRoot: env.codexSessionsRoot,
+            cacheRoot: env.cacheRoot,
+            codexTraceDatabaseURL: env.root.appendingPathComponent("missing-traces.sqlite"))
+        scannerOptions.refreshMinIntervalSeconds = 0
+        let merged = try await CostUsageFetcher.loadTokenResult(
+            provider: .codex,
+            environment: [
+                "OPENCODE_DB": databaseURL.path,
+                "HOME": env.root.path,
+            ],
+            now: day,
+            historyDays: 7,
+            allowPricingRefresh: false,
+            includePiSessions: false,
+            includeOpenCodeLocalHistory: true,
+            scannerOptions: scannerOptions)
+
+        // The full snapshot is mixed: list-priced native rows and recorded OpenCode rows.
+        #expect(merged.snapshot.costProvenance == .mixed)
+        // A window covering both days is mixed too.
+        #expect(merged.snapshot.summary(forLastDays: 7, calendar: scannerOptions.calendar).provenance == .mixed)
+        // But the one-day window holds only the recorded row: no list-price amount exists
+        // in it, so claiming a mixed estimate would be false.
+        let today = merged.snapshot.summary(forLastDays: 1, calendar: scannerOptions.calendar)
+        #expect(today.provenance == .sourceRecorded)
+        #expect(today.totalCostUSD != nil)
+    }
+
+    @Test
     func `unpriced native history keeps provenance source recorded`() async throws {
         let env = try CostUsageTestEnvironment()
         defer { env.cleanup() }
