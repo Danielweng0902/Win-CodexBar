@@ -1463,7 +1463,7 @@ extension UsageStore {
             return
         }
 
-        guard self.settings.isCostUsageEffectivelyEnabled(for: provider), self.isEnabled(provider) else {
+        guard self.settings.isHistoryLaneEffectivelyEnabled(for: provider), self.isEnabled(provider) else {
             self.resetTokenUsageState(for: provider)
             return
         }
@@ -1539,7 +1539,8 @@ extension UsageStore {
                 codexHomePath: costScope.codexHomePath,
                 historyDays: historyDays,
                 cursorCookieHeaderOverride: cursorCookieHeaderOverride,
-                includePiSessions: self.shouldIncludePiSessionsInTokenSnapshot(for: provider))
+                includePiSessions: self.shouldIncludePiSessionsInTokenSnapshot(for: provider),
+                includeOpenCodeLocalHistory: self.shouldIncludeOpenCodeLocalHistoryInTokenSnapshot(for: provider))
             try self.commitTokenUsageResult(result, context: refreshContext)
         } catch {
             guard self.tokenRefreshPublicationDisposition(
