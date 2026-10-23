@@ -9,6 +9,7 @@ private struct CodexCostCatchUpContext {
     let providerConfigRevision: UInt64
     let costUsageSettingsRevision: UInt64
     let includePiSessions: Bool
+    let includeOpenCodeLocalHistory: Bool
     @ProcessEnvironment private(set) var environment: [String: String]
     let piHistoryScopeGeneration: UInt64
 }
@@ -54,6 +55,7 @@ extension UsageStore {
             providerConfigRevision: self.settings.providerConfigRevision(for: .codex),
             costUsageSettingsRevision: self.settings.costUsageSettingsRevision,
             includePiSessions: self.shouldIncludePiSessionsInTokenSnapshot(for: .codex),
+            includeOpenCodeLocalHistory: self.shouldIncludeOpenCodeLocalHistoryInTokenSnapshot(for: .codex),
             environment: self.environmentBase,
             piHistoryScopeGeneration: self.piHistoryScopeGeneration)
         self.codexCostCatchUpToken = token
@@ -254,6 +256,7 @@ extension UsageStore {
                 codexHomePath: context.codexHomePath,
                 historyDays: context.historyDays,
                 includePiSessions: context.includePiSessions,
+                includeOpenCodeLocalHistory: context.includeOpenCodeLocalHistory,
                 calendar: self.settings.costUsageBucketCalendar,
                 requireCompleteHistory: true,
                 environment: context.environment)

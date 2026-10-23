@@ -527,6 +527,265 @@ struct OpenCodeLocalHistoryStoreTests {
         #expect(store.cachedDailyReport(
             since: now.addingTimeInterval(-3600), until: now, calendar: .current) == nil)
     }
+
+    // MARK: - bounded ingestion, validation, recovery
+
+    @Test
+    func `bounded ingestion resumes across passes and converges`() throws {
+        let env = try Self.makeEnvironment()
+        defer { try? FileManager.default.removeItem(at: env.root) }
+        try Self.createDatabase(at: env.databaseURL)
+        let now = Date(timeIntervalSince1970: 1_772_798_400)
+        // Five rows across distinct milliseconds so the continuation cursor stays stable.
+        for index in 0..<5 {
+            try Self.insertMessage(
+                databaseURL: env.databaseURL, createdMs: Self.ms(now) - Int64(index),
+                cost: Double(index + 1), model: "gpt-5.1-codex", providerID: "openai")
+        }
+
+        // A two-row budget forces multi-pass ingestion; the store must converge on the
+        // complete history instead of stalling or discarding earlier batches.
+        let store = OpenCodeLocalHistoryStore(
+            databaseURL: env.databaseURL, cacheURL: env.cacheURL, ingestionRowBudget: 2)
+        var converged: CostUsageDailyReport?
+        for _ in 0..<10 {
+            converged = try store.loadDailyReport(
+                since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+            if converged?.data.first?.requestCount == 5 { break }
+        }
+        let entry = try #require(converged?.data.first)
+        #expect(entry.requestCount == 5)
+        #expect(entry.costUSD == 15)
+
+        // Once converged the cache is complete: a further load serves the same rows.
+        let settled = try store.loadDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+        #expect(settled?.data.first?.requestCount == 5)
+        #expect(settled?.data.first?.costUSD == 15)
+    }
+
+    @Test
+    func `cached publication rejects a cache built for another database`() throws {
+        let env = try Self.makeEnvironment()
+        defer { try? FileManager.default.removeItem(at: env.root) }
+        try Self.createDatabase(at: env.databaseURL)
+        let now = Date(timeIntervalSince1970: 1_772_798_400)
+        try Self.insertMessage(
+            databaseURL: env.databaseURL, createdMs: Self.ms(now), cost: 1,
+            model: "gpt-5.1-codex", providerID: "openai")
+
+        let store = OpenCodeLocalHistoryStore(databaseURL: env.databaseURL, cacheURL: env.cacheURL)
+        _ = try store.loadDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+
+        // A different database selecting the same cache file must not be served the rows
+        // persisted for this one — the source identity is compared, never re-statted.
+        let otherStore = OpenCodeLocalHistoryStore(
+            databaseURL: env.root.appendingPathComponent("other.db", isDirectory: false),
+            cacheURL: env.cacheURL)
+        #expect(otherStore.cachedDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current) == nil)
+
+        // The store the cache was built for still reads it.
+        #expect(store.cachedDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current) != nil)
+    }
+
+    @Test
+    func `a damaged cache is discarded and rebuilt`() throws {
+        let env = try Self.makeEnvironment()
+        defer { try? FileManager.default.removeItem(at: env.root) }
+        try Self.createDatabase(at: env.databaseURL)
+        let now = Date(timeIntervalSince1970: 1_772_798_400)
+        try Self.insertMessage(
+            databaseURL: env.databaseURL, createdMs: Self.ms(now), cost: 1,
+            model: "gpt-5.1-codex", providerID: "openai")
+
+        let store = OpenCodeLocalHistoryStore(databaseURL: env.databaseURL, cacheURL: env.cacheURL)
+        _ = try store.loadDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+
+        // Corrupt the durable cache: a cached publication misses and removes it instead of
+        // throwing or silently omitting OpenCode history forever.
+        try Data("not a database".utf8).write(to: env.cacheURL)
+        #expect(store.cachedDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current) == nil)
+        #expect(!FileManager.default.fileExists(atPath: env.cacheURL.path))
+
+        // The next scan rebuilds it from the source database.
+        let rebuilt = try store.loadDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+        #expect(rebuilt?.data.first?.costUSD == 1)
+        #expect(store.cachedDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current)?.data.first?.costUSD == 1)
+    }
+
+    @Test
+    func `legacy rows suppressed only when usable cover their migrated v2 copies`() throws {
+        let env = try Self.makeEnvironment()
+        defer { try? FileManager.default.removeItem(at: env.root) }
+        try Self.createDatabase(at: env.databaseURL, includeSessionMessages: true)
+        let now = Date(timeIntervalSince1970: 1_772_798_400)
+
+        // Usable through a valid step-finish part even though the message-level cost is
+        // invalid: the migrated v2 copy stays excluded — counted exactly once, via the part.
+        let partBackedID = UUID().uuidString
+        try Self.insertRawMessage(
+            databaseURL: env.databaseURL,
+            id: partBackedID,
+            createdMs: Self.ms(now),
+            json: Self.json([
+                "providerID": "openai",
+                "role": "assistant",
+                "modelID": "gpt-5.1-codex",
+                "time": ["created": Self.ms(now)],
+            ]))
+        try Self.insertStepFinishPart(
+            databaseURL: env.databaseURL,
+            messageID: partBackedID,
+            createdMs: Self.ms(now),
+            cost: 4)
+        try Self.insertSessionMessage(
+            databaseURL: env.databaseURL, id: partBackedID, createdMs: Self.ms(now), cost: 4,
+            model: "gpt-5.1-codex")
+
+        // Unusable legacy (invalid message cost, no valid part): the v2 copy counts instead
+        // of being suppressed by a legacy row that itself contributes nothing.
+        try Self.insertRawMessage(
+            databaseURL: env.databaseURL,
+            id: "broken-legacy",
+            createdMs: Self.ms(now),
+            json: Self.json([
+                "providerID": "openai",
+                "role": "assistant",
+                "cost": "oops",
+                "time": ["created": Self.ms(now)],
+            ]))
+        try Self.insertSessionMessage(
+            databaseURL: env.databaseURL, id: "broken-legacy", createdMs: Self.ms(now), cost: 7,
+            model: "gpt-5.2")
+
+        let loaded = try OpenCodeLocalHistoryStore(
+            databaseURL: env.databaseURL, cacheURL: env.cacheURL)
+            .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+        let entry = try #require(loaded?.data.first)
+        #expect(entry.requestCount == 2)
+        #expect(entry.costUSD == 11)
+        #expect(entry.modelsUsed?.sorted() == ["gpt-5.1-codex (OpenCode local)", "gpt-5.2 (OpenCode local)"])
+    }
+
+    // MARK: - incremental ingestion
+
+    @Test
+    func `multiple step finish parts on one message count separately`() throws {
+        let env = try Self.makeEnvironment()
+        defer { try? FileManager.default.removeItem(at: env.root) }
+        try Self.createDatabase(at: env.databaseURL)
+        let now = Date(timeIntervalSince1970: 1_772_798_400)
+        let messageID = try Self.insertMessage(
+            databaseURL: env.databaseURL, createdMs: Self.ms(now), cost: 9,
+            model: "gpt-5.1-codex", providerID: "openai")
+        try Self.insertStepFinishPart(
+            databaseURL: env.databaseURL, messageID: messageID, createdMs: Self.ms(now), cost: 0.4)
+        try Self.insertStepFinishPart(
+            databaseURL: env.databaseURL, messageID: messageID, createdMs: Self.ms(now), cost: 0.6)
+
+        let loaded = try OpenCodeLocalHistoryStore(databaseURL: env.databaseURL, cacheURL: env.cacheURL)
+            .loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+        let entry = try #require(loaded?.data.first)
+        // One entry per valid step-finish part, like the Go reader; the message fallback
+        // never contributes alongside parts.
+        #expect(entry.requestCount == 2)
+        #expect(entry.costUSD == 1.0)
+    }
+
+    @Test
+    func `appended rows ingest incrementally without rescanning history`() throws {
+        let env = try Self.makeEnvironment()
+        defer { try? FileManager.default.removeItem(at: env.root) }
+        try Self.createDatabase(at: env.databaseURL)
+        let now = Date(timeIntervalSince1970: 1_772_798_400)
+        try Self.insertMessage(
+            databaseURL: env.databaseURL, createdMs: Self.ms(now), cost: 1,
+            model: "gpt-5.1-codex", providerID: "openai")
+
+        let store = OpenCodeLocalHistoryStore(databaseURL: env.databaseURL, cacheURL: env.cacheURL)
+        _ = try store.loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+
+        // The completed pass leaves the high cursor just past the newest source row and
+        // the low cursor at fully ingested.
+        #expect(Self.cacheMetaInt(env.cacheURL, "messageHigh") == 2)
+        #expect(Self.cacheMetaInt(env.cacheURL, "messageLow") == 0)
+        #expect(Self.cacheMetaInt(env.cacheURL, "ingestComplete") == 1)
+
+        // Two appended rows land above the cursor; the next pass reads only those.
+        try Self.insertMessage(
+            databaseURL: env.databaseURL, createdMs: Self.ms(now), cost: 2,
+            model: "gpt-5.1-codex", providerID: "openai")
+        try Self.insertMessage(
+            databaseURL: env.databaseURL, createdMs: Self.ms(now), cost: 3,
+            model: "gpt-5.1-codex", providerID: "openai")
+        let second = try store.loadDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+        #expect(second?.data.first?.requestCount == 3)
+        #expect(second?.data.first?.costUSD == 6)
+        #expect(Self.cacheMetaInt(env.cacheURL, "messageHigh") == 4)
+        #expect(Self.cacheMetaInt(env.cacheURL, "ingestComplete") == 1)
+    }
+
+    @Test
+    func `deleted source rows trigger a fresh re-ingest`() throws {
+        let env = try Self.makeEnvironment()
+        defer { try? FileManager.default.removeItem(at: env.root) }
+        try Self.createDatabase(at: env.databaseURL)
+        let now = Date(timeIntervalSince1970: 1_772_798_400)
+        try Self.insertMessage(
+            databaseURL: env.databaseURL, createdMs: Self.ms(now), cost: 1,
+            model: "gpt-5.1-codex", providerID: "openai")
+        try Self.insertMessage(
+            databaseURL: env.databaseURL, createdMs: Self.ms(now), cost: 2,
+            model: "gpt-5.1-codex", providerID: "openai")
+
+        let store = OpenCodeLocalHistoryStore(databaseURL: env.databaseURL, cacheURL: env.cacheURL)
+        _ = try store.loadDailyReport(since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+
+        // A deleted row shrinks the raw table count: append windows would keep it alive,
+        // so the pass restarts fresh and the row disappears.
+        try Self.executeRaw(
+            databaseURL: env.databaseURL,
+            sql: "DELETE FROM message WHERE id = (SELECT id FROM message ORDER BY rowid LIMIT 1)")
+        let after = try store.loadDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+        #expect(after?.data.first?.requestCount == 1)
+        #expect(after?.data.first?.costUSD == 2)
+    }
+
+    @Test
+    func `a late step finish part replaces the message fallback`() throws {
+        let env = try Self.makeEnvironment()
+        defer { try? FileManager.default.removeItem(at: env.root) }
+        try Self.createDatabase(at: env.databaseURL)
+        let now = Date(timeIntervalSince1970: 1_772_798_400)
+        let messageID = try Self.insertMessage(
+            databaseURL: env.databaseURL, createdMs: Self.ms(now), cost: 5,
+            model: "gpt-5.1-codex", providerID: "openai")
+
+        let store = OpenCodeLocalHistoryStore(databaseURL: env.databaseURL, cacheURL: env.cacheURL)
+        let fallback = try store.loadDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+        // No part exists yet: the message-level fallback contributes.
+        #expect(fallback?.data.first?.requestCount == 1)
+        #expect(fallback?.data.first?.costUSD == 5)
+
+        // The step-finish lands after the message was ingested: re-evaluation must
+        // replace the fallback row, not add the part beside it.
+        try Self.insertStepFinishPart(
+            databaseURL: env.databaseURL, messageID: messageID, createdMs: Self.ms(now), cost: 2)
+        let updated = try store.loadDailyReport(
+            since: now.addingTimeInterval(-3600), until: now, calendar: .current)
+        #expect(updated?.data.first?.requestCount == 1)
+        #expect(updated?.data.first?.costUSD == 2)
+    }
 }
 
 extension OpenCodeLocalHistoryStoreTests {
@@ -790,6 +1049,38 @@ extension OpenCodeLocalHistoryStoreTests {
 
     private static func ms(_ date: Date) -> Int64 {
         Int64(date.timeIntervalSince1970 * 1000)
+    }
+
+    /// Reads an integer meta value from the store's durable cache, for asserting cursor
+    /// state in incremental-ingestion tests.
+    private static func cacheMetaInt(_ cacheURL: URL, _ key: String) -> Int64? {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(cacheURL.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            sqlite3_close(db)
+            return nil
+        }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        let sql = "SELECT value FROM meta WHERE key = '\(key)'"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW, let text = sqlite3_column_text(stmt, 0) else {
+            return nil
+        }
+        return Int64(String(cString: text))
+    }
+
+    /// Runs raw SQL against a test database (deletions and other mutations the typed
+    /// helpers do not express).
+    private static func executeRaw(databaseURL: URL, sql: String) throws {
+        var db: OpaquePointer?
+        guard sqlite3_open(databaseURL.path, &db) == SQLITE_OK else { throw SQLiteTestError.open }
+        defer { sqlite3_close(db) }
+        var message: UnsafeMutablePointer<CChar>?
+        guard sqlite3_exec(db, sql, nil, nil, &message) == SQLITE_OK else {
+            sqlite3_free(message)
+            throw SQLiteTestError.exec
+        }
     }
 
     private enum SQLiteTestError: Error {

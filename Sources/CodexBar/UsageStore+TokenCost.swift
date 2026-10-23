@@ -784,6 +784,15 @@ extension UsageStore {
             .appendingPathComponent("cost-usage", isDirectory: true)
     }
 
+    nonisolated static func openCodeLocalHistoryCacheDirectory(
+        fileManager: FileManager = .default) -> URL
+    {
+        let root = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        return root
+            .appendingPathComponent("CodexBar", isDirectory: true)
+            .appendingPathComponent("opencode-local-history", isDirectory: true)
+    }
+
     func clearCostUsageCache(
         fileManagerFactory: @escaping @Sendable () -> FileManager = { .default }) async -> String?
     {
@@ -792,10 +801,18 @@ extension UsageStore {
             do {
                 try fileManager.removeItem(at: Self.costUsageCacheDirectory(fileManager: fileManager))
             } catch let error as NSError {
-                if error.domain == NSCocoaErrorDomain, error.code == NSFileNoSuchFileError {
-                    return nil
+                if error.domain != NSCocoaErrorDomain || error.code != NSFileNoSuchFileError {
+                    return error.localizedDescription
                 }
-                return error.localizedDescription
+            }
+            // The OpenCode local history cache lives beside the cost-usage cache; clearing
+            // cost caches covers it too so stale rows cannot survive the action.
+            do {
+                try fileManager.removeItem(at: Self.openCodeLocalHistoryCacheDirectory(fileManager: fileManager))
+            } catch let error as NSError {
+                if error.domain != NSCocoaErrorDomain || error.code != NSFileNoSuchFileError {
+                    return error.localizedDescription
+                }
             }
             return nil
         }.value

@@ -81,6 +81,17 @@ extension CodexBarCLI {
         {
             Self.writeStderr("Warning: \(warning)\n")
         }
+        // Provider-specific by design: OpenCode rows cannot be attributed to Codex sessions.
+        if providers.contains(.codex),
+           !output.jsonOnly,
+           let warning = Self.sessionGroupingOpenCodeOmissionWarning(
+               provider: .codex,
+               groupBy: groupBy,
+               format: format,
+               includeOpenCodeLocalHistory: Self.openCodeLocalHistorySettingEnabled())
+        {
+            Self.writeStderr("Warning: \(warning)\n")
+        }
 
         let fetcher = CostUsageFetcher(calendar: bucketCalendar)
         let outputProviders = Self.costProviders(providers, groupBy: groupBy, format: format)
@@ -124,6 +135,10 @@ extension CodexBarCLI {
                         groupBy: groupBy,
                         format: format,
                         includePiSessions: includePiSessions),
+                    includeOpenCodeLocalHistory: Self.costIncludeOpenCodeLocalHistory(
+                        provider: provider,
+                        groupBy: groupBy,
+                        format: format),
                     piSessionProcessContexts: piSessionProcessContexts).reporting(period)
                 switch format {
                 case .text:
@@ -265,7 +280,7 @@ extension CodexBarCLI {
                 calendar: calendar,
                 useColor: useColor))
         }
-        lines.append(Self.costEstimateHint(provider: provider))
+        lines.append(Self.costEstimateHint(provider: provider, provenance: snapshot.costProvenance))
         return lines.compactMap(\.self).joined(separator: "\n")
     }
 
@@ -484,7 +499,7 @@ extension CodexBarCLI {
         var lines = [header, "Projects (\(historyLabel)):"]
         guard !snapshot.projects.isEmpty else {
             lines.append("—")
-            lines.append(Self.costEstimateHint(provider: .codex))
+            lines.append(Self.costEstimateHint(provider: .codex, provenance: snapshot.costProvenance))
             return lines.joined(separator: "\n")
         }
         for project in snapshot.projects {
@@ -507,7 +522,7 @@ extension CodexBarCLI {
                 }
             }
         }
-        lines.append(Self.costEstimateHint(provider: .codex))
+        lines.append(Self.costEstimateHint(provider: .codex, provenance: snapshot.costProvenance))
         return lines.joined(separator: "\n")
     }
 
@@ -523,7 +538,7 @@ extension CodexBarCLI {
                 lines.append("—")
             }
             // Provider-specific by design: session output uses Codex's local estimate hint.
-            lines.append(Self.costEstimateHint(provider: .codex))
+            lines.append(Self.costEstimateHint(provider: .codex, provenance: snapshot.costProvenance))
             return lines.joined(separator: "\n")
         }
         for session in snapshot.sessions {
@@ -541,7 +556,7 @@ extension CodexBarCLI {
             lines.append("\(modelLabel) · \(Self.sessionTimestampString(session.lastActivity))")
         }
         // Provider-specific by design: session output uses Codex's local estimate hint.
-        lines.append(Self.costEstimateHint(provider: .codex))
+        lines.append(Self.costEstimateHint(provider: .codex, provenance: snapshot.costProvenance))
         return lines.joined(separator: "\n")
     }
 
@@ -571,10 +586,58 @@ extension CodexBarCLI {
         return formatter.string(from: date)
     }
 
-    private static func costEstimateHint(provider: UsageProvider) -> String {
-        provider == .codex
-            ? "Not a subscription bill or plan value · local usage × public API prices"
-            : UsageFormatter.costEstimateHint(provider: provider)
+    private static func costEstimateHint(
+        provider: UsageProvider,
+        provenance: CostProvenance = .listPriceEstimate) -> String
+    {
+        // Provider-specific by design: only Codex history mixes source-recorded OpenCode
+        // costs into an otherwise list-price estimate, so only it needs provenance copy.
+        guard provider == .codex else {
+            return UsageFormatter.costEstimateHint(provider: provider)
+        }
+        switch provenance {
+        case .sourceRecorded:
+            return "Not a subscription bill or plan value · local usage · OpenCode rows carry source-recorded cost"
+        case .mixed:
+            return "Not a subscription bill or plan value · local usage × public API prices + source-recorded OpenCode cost"
+        default:
+            return "Not a subscription bill or plan value · local usage × public API prices"
+        }
+    }
+
+    static func openCodeLocalHistorySettingEnabled() -> Bool {
+        boolFromAppDefaults("codexIncludeOpenCodeLocalHistory") ?? false
+    }
+
+    /// Provider-specific by design: machine-local OpenCode history joins only the ambient Codex
+    /// cost report, behind the same default-off app setting the menu uses (#3273 contract).
+    /// Session text reports rely on native Codex session attribution, so the merge stays out
+    /// of that view, exactly like Pi; JSON output keeps it.
+    static func costIncludeOpenCodeLocalHistory(
+        provider: UsageProvider,
+        groupBy: CostGroupBy,
+        format: OutputFormat) -> Bool
+    {
+        if provider == .codex, groupBy == .session, format == .text {
+            return false
+        }
+        return provider == .codex && Self.openCodeLocalHistorySettingEnabled()
+    }
+
+    static func sessionGroupingOpenCodeOmissionWarning(
+        provider: UsageProvider,
+        groupBy: CostGroupBy,
+        format: OutputFormat,
+        includeOpenCodeLocalHistory: Bool) -> String?
+    {
+        // Provider-specific by design: only Codex local session text warns about omitted sources.
+        guard provider == .codex,
+              groupBy == .session,
+              format == .text,
+              includeOpenCodeLocalHistory
+        else { return nil }
+        return "Session grouping shows native Codex conversations only; OpenCode local history is omitted from this view. "
+            + "Use the default cost view for merged totals."
     }
 
     private static func costHeaderLine(_ header: String, useColor: Bool) -> String {
